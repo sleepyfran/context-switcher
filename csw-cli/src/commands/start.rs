@@ -7,6 +7,7 @@ use csw_core::identity;
 use csw_core::ops::{
     self, EditorStatus, ListRequest, StartAction, StartRequest, StartSuccess, TaskEntry,
 };
+use csw_core::paths;
 use dialoguer::FuzzySelect;
 use dialoguer::theme::ColorfulTheme;
 use std::collections::BTreeMap;
@@ -19,7 +20,7 @@ pub fn run(args: StartArgs) -> Result<i32> {
     let (raw_task, repos_override) = match args.task_id {
         Some(t) => (t, None),
         None => {
-            let entry = pick_existing_task(&config, &resolved_user)?;
+            let entry = resolve_task_without_arg(&config, &resolved_user)?;
             let repos: Vec<String> = entry.repos.iter().map(|r| r.repo.clone()).collect();
             (entry.task_id, Some(repos))
         }
@@ -88,6 +89,39 @@ fn parse_branch_overrides(input: &[String]) -> Result<BTreeMap<String, String>> 
         }
     }
     Ok(out)
+}
+
+/// Resolve which task to resume when `csw start` is invoked with no task
+/// argument. First tries to infer the task from the current directory (so
+/// running `csw start` from inside a task worktree resumes it), then falls
+/// back to listing every task on disk and picking one.
+fn resolve_task_without_arg(config: &Config, user: &str) -> Result<TaskEntry> {
+    if let Some(entry) = task_from_cwd(config, user)? {
+        output::step(format!(
+            "resuming task from current directory: {}",
+            entry.task_id
+        ));
+        return Ok(entry);
+    }
+    pick_existing_task(config, user)
+}
+
+/// Infer the task owning the current working directory, if any. Returns the
+/// full `TaskEntry` (spanning every repo the task lives in) so behaviour
+/// matches selecting that task from the picker.
+fn task_from_cwd(config: &Config, user: &str) -> Result<Option<TaskEntry>> {
+    let cwd = std::env::current_dir()?;
+    let Some((_repo, task_id, _root)) = paths::infer_task_from_path(config, user, &cwd) else {
+        return Ok(None);
+    };
+    let entries = ops::list::list(
+        config,
+        &ListRequest {
+            user: user.to_string(),
+            only_repo: None,
+        },
+    )?;
+    Ok(entries.into_iter().find(|t| t.task_id == task_id))
 }
 
 /// Used when `csw start` is invoked without a task argument. Lists every

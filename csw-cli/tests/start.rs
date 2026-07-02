@@ -389,6 +389,35 @@ fn start_writes_sidecar_with_title() {
 }
 
 #[test]
+fn start_without_arg_infers_task_from_current_directory() {
+    let h = Harness::new();
+    h.config_set_base_dir();
+    h.config_set_username("alice");
+    h.add_repo("frontend", "");
+
+    // Create two tasks so a bare `csw start` would otherwise need a picker.
+    h.cmd()
+        .args(["start", "PROJ-1", "--repos", "frontend", "--no-editor"])
+        .assert()
+        .success();
+    h.cmd()
+        .args(["start", "PROJ-2", "--repos", "frontend", "--no-editor"])
+        .assert()
+        .success();
+
+    // Running `csw start` from inside PROJ-1's worktree should resume PROJ-1
+    // without prompting.
+    let worktree = h.worktree_path("frontend", "alice", "PROJ-1");
+    h.cmd()
+        .current_dir(&worktree)
+        .args(["start", "--no-editor"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("PROJ-1"))
+        .stderr(predicate::str::contains("current directory"));
+}
+
+#[test]
 fn start_accepts_no_cmux_flag() {
     let h = Harness::new();
     h.config_set_base_dir();
