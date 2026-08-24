@@ -1,4 +1,5 @@
 use crate::cli::StatusArgs;
+use crate::output;
 use anyhow::{Result, anyhow};
 use csw_core::config::Config;
 use csw_core::identity;
@@ -7,6 +8,9 @@ use csw_core::paths;
 
 pub fn run(args: StatusArgs) -> Result<i32> {
     let config = Config::load()?;
+    if let Some(warning) = ops::legacy_warning(&config) {
+        output::warn(warning);
+    }
     let resolved_user = identity::resolve_username(&config)?;
     let (user, task_id) = match args.task_id {
         Some(t) => ops::parse_task_input(&t, &resolved_user),

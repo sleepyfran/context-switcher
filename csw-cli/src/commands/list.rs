@@ -8,6 +8,9 @@ use serde_json::json;
 
 pub fn run(args: ListArgs) -> Result<i32> {
     let config = Config::load()?;
+    if let Some(warning) = ops::legacy_warning(&config) {
+        crate::output::warn(warning);
+    }
     let user = identity::resolve_username(&config)?;
     let request = ListRequest {
         user,

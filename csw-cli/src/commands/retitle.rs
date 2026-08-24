@@ -9,6 +9,9 @@ use csw_core::paths;
 
 pub fn run(args: RetitleArgs) -> Result<i32> {
     let config = Config::load()?;
+    if let Some(warning) = ops::legacy_warning(&config) {
+        output::warn(warning);
+    }
     let resolved_user = identity::resolve_username(&config)?;
 
     // Two positional forms:

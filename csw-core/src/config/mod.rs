@@ -31,6 +31,20 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub default_repos: Vec<String>,
 
+    /// Command run in the bottom CMux pane, rooted at the task's root
+    /// folder (visible to every repo the task was started with). No
+    /// `{path}` placeholder — CMux always `cd`s into the task root before
+    /// running it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+
+    /// When `true`, restores the legacy behavior: each repo's `editor`
+    /// launches as a detached GUI process (`editor::spawn`), independent of
+    /// CMux, and no top-row editor panes are built. Defaults to `false`
+    /// (attached): editors run as CMux pane commands in the top row.
+    #[serde(default)]
+    pub detached_editor: bool,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmux: Option<GlobalCmuxConfig>,
 
@@ -45,6 +59,8 @@ impl Default for Config {
             tasks_dir: default_tasks_dir(),
             username: None,
             default_repos: Vec::new(),
+            agent: None,
+            detached_editor: false,
             cmux: None,
             repos: BTreeMap::new(),
         }
@@ -164,10 +180,11 @@ impl Config {
         }
     }
 
-    /// Directory under which this repo's task worktrees live, i.e.
-    /// `<tasks_dir>/<repo_name>/`.
-    pub fn repo_tasks_dir(&self, repo_name: &str) -> PathBuf {
-        self.tasks_dir.join(repo_name)
+    /// Root directory for a single task's worktrees, i.e.
+    /// `<tasks_dir>/<user>-<task_id>/`. Every repo the task was started
+    /// with lives as a subdirectory beneath this.
+    pub fn task_root(&self, user: &str, task_id: &str) -> PathBuf {
+        self.tasks_dir.join(crate::paths::worktree_dirname(user, task_id))
     }
 
     /// Pretty TOML representation, used by `csw config show`.
@@ -226,7 +243,7 @@ mod tests {
                 editor: "zed {path}".into(),
                 base_branch: Some("develop".into()),
                 post_create: Vec::new(),
-                cmux: None,
+                additional_panels: 2,
             },
         );
         let cfg = Config {
@@ -234,6 +251,8 @@ mod tests {
             tasks_dir: PathBuf::from("/tmp/csw/tasks"),
             username: Some("alice".into()),
             default_repos: vec!["frontend".into()],
+            agent: Some("claude".into()),
+            detached_editor: true,
             cmux: None,
             repos,
         };
@@ -301,14 +320,14 @@ editor = "zed {path}"
     }
 
     #[test]
-    fn repo_tasks_dir_joins_repo_name() {
+    fn task_root_joins_user_and_task_id() {
         let cfg = Config {
             tasks_dir: PathBuf::from("/csw/tasks"),
             ..Config::default()
         };
         assert_eq!(
-            cfg.repo_tasks_dir("frontend"),
-            PathBuf::from("/csw/tasks/frontend")
+            cfg.task_root("alice", "PROJ-1"),
+            PathBuf::from("/csw/tasks/alice-PROJ-1")
         );
     }
 

@@ -1,4 +1,3 @@
-use crate::cmux::config::RepoCmuxConfig;
 use crate::hooks::HookAction;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -11,8 +10,16 @@ pub struct RepoConfig {
     pub base_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_create: Vec<HookAction>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cmux: Option<RepoCmuxConfig>,
+    /// Extra idle tabs (CMux surfaces) stacked behind the repo's editor pane
+    /// in the top row, each `cd`'d into the repo's worktree with nothing
+    /// autostarting. Switch between them with ⌘[ / ⌘]. Only takes effect
+    /// when editors are attached (`detached_editor = false`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub additional_panels: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl RepoConfig {
@@ -22,7 +29,7 @@ impl RepoConfig {
             editor: editor.into(),
             base_branch: None,
             post_create: Vec::new(),
-            cmux: None,
+            additional_panels: 0,
         }
     }
 }

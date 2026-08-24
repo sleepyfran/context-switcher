@@ -10,6 +10,9 @@ use std::io::{self, BufRead, Write};
 
 pub fn run(args: DoneArgs) -> Result<i32> {
     let config = Config::load()?;
+    if let Some(warning) = ops::legacy_warning(&config) {
+        output::warn(warning);
+    }
     let resolved_user = identity::resolve_username(&config)?;
     let (user, task_id) = match args.task_id {
         Some(t) => ops::parse_task_input(&t, &resolved_user),

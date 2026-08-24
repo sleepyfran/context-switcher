@@ -175,7 +175,7 @@ exit 0
     let pwd = std::fs::read_to_string(copy.join(".nav-pwd")).unwrap();
     let env = std::fs::read_to_string(copy.join(".nav-env")).unwrap();
     let pwd_basename = pwd.trim().rsplit('/').next().unwrap();
-    assert_eq!(pwd_basename, "alice-PROJ-1");
+    assert_eq!(pwd_basename, "frontend");
     assert_eq!(env, "PROJ-1|frontend|alice");
 }
 

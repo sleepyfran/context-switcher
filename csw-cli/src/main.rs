@@ -32,5 +32,6 @@ fn real_main() -> Result<i32> {
         Command::List(args) => commands::list::run(args),
         Command::Retitle(args) => commands::retitle::run(args),
         Command::Config(cmd) => commands::config_cmd::run(cmd).map(|_| 0),
+        Command::Migrate(args) => commands::migrate::run(args),
     }
 }

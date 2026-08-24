@@ -16,9 +16,9 @@ pub mod build;
 pub mod client;
 pub mod config;
 
-pub use build::{BuildOptions, BuildOutcome, Contributor};
-pub use client::{CmuxClient, CmuxError};
-pub use config::{GlobalCmuxConfig, PaneSpec, RepoCmuxConfig, SplitDirection, TabSpec};
+pub use build::{BuildOptions, BuildOutcome, Contributor, WorkspaceSpec};
+pub use client::{CmuxClient, CmuxError, SplitDirection};
+pub use config::GlobalCmuxConfig;
 
 /// Environment variable CMux auto-exports inside every surface. Its presence
 /// is how we know csw is being invoked from inside CMux.
@@ -70,13 +70,14 @@ pub fn setup(
     task_id: &str,
     title: Option<&str>,
     contributors: &[Contributor],
+    spec: &WorkspaceSpec,
     options: BuildOptions,
 ) -> CmuxOutcome {
-    if contributors.is_empty() {
+    if !build::has_content(contributors, spec) {
         return CmuxOutcome::NoContributors;
     }
     match client::connect() {
-        Ok(mut client) => setup_with(&mut client, task_id, title, contributors, options),
+        Ok(mut client) => setup_with(&mut client, task_id, title, contributors, spec, options),
         Err(e) => CmuxOutcome::Warned(format!("cmux: socket connect failed: {e}")),
     }
 }
@@ -88,9 +89,10 @@ pub fn setup_with(
     task_id: &str,
     title: Option<&str>,
     contributors: &[Contributor],
+    spec: &WorkspaceSpec,
     options: BuildOptions,
 ) -> CmuxOutcome {
-    match build::build_workspace(client, task_id, title, contributors, options) {
+    match build::build_workspace(client, task_id, title, contributors, spec, options) {
         Ok(BuildOutcome::Created { name, .. }) => CmuxOutcome::Created { name },
         Ok(BuildOutcome::Adopted { name, .. }) => CmuxOutcome::Adopted { name },
         Ok(BuildOutcome::Reused { name, .. }) => CmuxOutcome::Reused { name },
@@ -142,28 +144,34 @@ mod tests {
     use super::*;
     use crate::cmux::client::Workspace;
     use crate::cmux::client::testing::RecordingClient;
-    use crate::cmux::config::{PaneSpec, RepoCmuxConfig};
     use std::path::PathBuf;
 
     fn one_contributor() -> Contributor {
         Contributor {
             repo: "fe".into(),
-            worktree_path: PathBuf::from("/csw/tasks/fe/alice-PROJ-1"),
-            layout: RepoCmuxConfig {
-                panes: vec![PaneSpec {
-                    cmd: Some("pnpm dev".into()),
-                    split: None,
-                    size: None,
-                    tabs: Vec::new(),
-                }],
-            },
+            worktree_path: PathBuf::from("/csw/tasks/alice-PROJ-1/fe"),
+            editor_cmd: Some("pnpm dev".into()),
+            additional_panels: 0,
+        }
+    }
+
+    fn spec() -> WorkspaceSpec {
+        WorkspaceSpec {
+            task_root: PathBuf::from("/csw/tasks/alice-PROJ-1"),
+            agent_cmd: Some("claude".into()),
+            editors_attached: true,
         }
     }
 
     #[test]
-    fn setup_with_empty_contributors_returns_no_contributors() {
+    fn setup_with_no_content_returns_no_contributors() {
         // We never connect, so the socket state is irrelevant.
-        let outcome = setup("PROJ-1", None, &[], BuildOptions::default());
+        let empty_spec = WorkspaceSpec {
+            task_root: PathBuf::from("/csw/tasks/alice-PROJ-1"),
+            agent_cmd: None,
+            editors_attached: true,
+        };
+        let outcome = setup("PROJ-1", None, &[], &empty_spec, BuildOptions::default());
         assert_eq!(outcome, CmuxOutcome::NoContributors);
     }
 
@@ -175,6 +183,7 @@ mod tests {
             "PROJ-1",
             None,
             &[one_contributor()],
+            &spec(),
             BuildOptions::default(),
         );
         assert!(matches!(outcome, CmuxOutcome::Created { ref name } if name == "PROJ-1"));
@@ -191,6 +200,7 @@ mod tests {
             "PROJ-1",
             None,
             &[one_contributor()],
+            &spec(),
             BuildOptions::default(),
         );
         assert!(matches!(outcome, CmuxOutcome::Reused { ref name } if name == "PROJ-1"));

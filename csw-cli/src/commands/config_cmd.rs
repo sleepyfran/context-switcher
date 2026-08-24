@@ -42,8 +42,20 @@ fn set(key: &str, value: &str) -> Result<()> {
             cfg.default_repos = parse_repo_list(value);
             validate_default_repos(&cfg)?;
         }
+        "agent" => {
+            cfg.agent = if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
+        "detached_editor" => {
+            cfg.detached_editor = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("detached_editor must be true or false"))?;
+        }
         other => bail!(
-            "unknown key '{other}' (expected: base_dir | tasks_dir | username | default_repos)"
+            "unknown key '{other}' (expected: base_dir | tasks_dir | username | default_repos | agent | detached_editor)"
         ),
     }
     cfg.save()?;
@@ -111,7 +123,7 @@ fn repo_add(
         editor,
         base_branch,
         post_create: Vec::new(),
-        cmux: None,
+        additional_panels: 0,
     };
     cfg.repos.insert(name.clone(), repo);
     if default && !cfg.default_repos.contains(&name) {
@@ -132,7 +144,14 @@ fn repo_set(name: String, field: String, value: String) -> Result<()> {
         "path" => repo.path = expand_home(&value),
         "editor" => repo.editor = value,
         "base_branch" => repo.base_branch = if value.is_empty() { None } else { Some(value) },
-        other => bail!("unknown field '{other}' (expected: path | editor | base_branch)"),
+        "additional_panels" => {
+            repo.additional_panels = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("additional_panels must be a non-negative integer"))?;
+        }
+        other => bail!(
+            "unknown field '{other}' (expected: path | editor | base_branch | additional_panels)"
+        ),
     }
     cfg.save()?;
     output::step(format!("updated repo '{name}'.{field}"));

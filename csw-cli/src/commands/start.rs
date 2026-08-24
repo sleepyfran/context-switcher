@@ -15,6 +15,9 @@ use std::io::IsTerminal;
 
 pub fn run(args: StartArgs) -> Result<i32> {
     let config = Config::load()?;
+    if let Some(warning) = ops::legacy_warning(&config) {
+        output::warn(warning);
+    }
     let resolved_user = identity::resolve_username(&config)?;
 
     let (raw_task, repos_override) = match args.task_id {
@@ -225,6 +228,7 @@ fn render_success(s: &StartSuccess) {
     ));
     match &s.editor {
         EditorStatus::Spawned => output::debug(format!("editor spawned for {}", s.repo)),
+        EditorStatus::Attached => output::debug(format!("editor attached (cmux) for {}", s.repo)),
         EditorStatus::Skipped => {}
         EditorStatus::Failed(e) => output::warn(format!("editor failed for {}: {e}", s.repo)),
     }

@@ -114,6 +114,63 @@ fn set_unknown_field_fails() {
 }
 
 #[test]
+fn set_additional_panels_updates_repo() {
+    let home = TempDir::new().unwrap();
+    let xdg = TempDir::new().unwrap();
+
+    csw(&home, &xdg)
+        .args([
+            "config",
+            "repo",
+            "add",
+            "frontend",
+            "--path",
+            "p",
+            "--editor",
+            "zed {path}",
+        ])
+        .assert()
+        .success();
+
+    csw(&home, &xdg)
+        .args(["config", "repo", "set", "frontend", "additional_panels", "2"])
+        .assert()
+        .success();
+
+    let out = csw(&home, &xdg).args(["config", "show"]).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("additional_panels = 2"), "{stdout}");
+}
+
+#[test]
+fn set_additional_panels_rejects_non_integer() {
+    let home = TempDir::new().unwrap();
+    let xdg = TempDir::new().unwrap();
+
+    csw(&home, &xdg)
+        .args([
+            "config",
+            "repo",
+            "add",
+            "frontend",
+            "--path",
+            "p",
+            "--editor",
+            "zed {path}",
+        ])
+        .assert()
+        .success();
+
+    csw(&home, &xdg)
+        .args(["config", "repo", "set", "frontend", "additional_panels", "nope"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "additional_panels must be a non-negative integer",
+        ));
+}
+
+#[test]
 fn remove_strips_from_default_repos() {
     let home = TempDir::new().unwrap();
     let xdg = TempDir::new().unwrap();
@@ -208,28 +265,26 @@ fn cmux_block_in_config_round_trips_through_show() {
     let home = TempDir::new().unwrap();
     let xdg = TempDir::new().unwrap();
 
-    // Lay down a config with a per-repo cmux layout by hand. We exercise
-    // the file-edit path the way a user would: edit the TOML, then verify
-    // `csw config show` echoes it back.
+    // Lay down a config by hand. We exercise the file-edit path the way a
+    // user would: edit the TOML, then verify `csw config show` echoes it
+    // back. The cmux layout is fixed now (no per-repo panes) — only the
+    // global enable/adoption knobs and the top-level agent/editor settings
+    // are configurable.
     let cfg_dir = xdg.path().join("context-switcher");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     std::fs::write(
         cfg_dir.join("config.toml"),
         r#"
 base_dir = "/tmp/dev"
+agent = "claude"
+detached_editor = true
 
 [cmux]
 enabled = true
 
 [repos.frontend]
 path = "frontend"
-editor = ""
-
-[repos.frontend.cmux]
-panes = [
-  { cmd = "pnpm dev" },
-  { cmd = "claude", split = "right" },
-]
+editor = "zed {path}"
 "#,
     )
     .unwrap();
@@ -241,10 +296,50 @@ panes = [
         .get_output()
         .clone();
     let stdout = String::from_utf8(out.stdout).unwrap();
-    // Don't depend on the emitter's choice of inline vs array-of-tables;
-    // just check the values survived the load + serialise round-trip.
-    assert!(stdout.contains(r#""pnpm dev""#), "{stdout}");
-    assert!(stdout.contains(r#""claude""#), "{stdout}");
-    assert!(stdout.contains(r#""right""#), "{stdout}");
+    assert!(stdout.contains(r#"agent = "claude""#), "{stdout}");
+    assert!(stdout.contains("detached_editor = true"), "{stdout}");
     assert!(stdout.contains("[cmux]"), "{stdout}");
+    assert!(stdout.contains(r#""zed {path}""#), "{stdout}");
+}
+
+#[test]
+fn set_agent_updates_config() {
+    let home = TempDir::new().unwrap();
+    let xdg = TempDir::new().unwrap();
+
+    csw(&home, &xdg)
+        .args(["config", "set", "agent", "claude"])
+        .assert()
+        .success();
+
+    let out = csw(&home, &xdg).args(["config", "show"]).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains(r#"agent = "claude""#), "{stdout}");
+}
+
+#[test]
+fn set_detached_editor_updates_config() {
+    let home = TempDir::new().unwrap();
+    let xdg = TempDir::new().unwrap();
+
+    csw(&home, &xdg)
+        .args(["config", "set", "detached_editor", "true"])
+        .assert()
+        .success();
+
+    let out = csw(&home, &xdg).args(["config", "show"]).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("detached_editor = true"), "{stdout}");
+}
+
+#[test]
+fn set_detached_editor_rejects_non_bool() {
+    let home = TempDir::new().unwrap();
+    let xdg = TempDir::new().unwrap();
+
+    csw(&home, &xdg)
+        .args(["config", "set", "detached_editor", "nope"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("detached_editor must be true or false"));
 }

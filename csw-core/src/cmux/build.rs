@@ -1,7 +1,7 @@
 //! Workspace build algorithm — turns a list of repo contributors into a CMux
-//! workspace with one pane per repo, laid out left-to-right, with each
-//! repo's per-repo `panes` config controlling the splits and tabs inside
-//! its slot.
+//! workspace with a fixed layout: a top row of one pane per repo (running
+//! that repo's editor, when editors are attached), and a single bottom pane
+//! running the task-level agent command, rooted at the task's root folder.
 //!
 //! Idempotent: a workspace named `csw/<task-id>` is reused if it already
 //! exists. No reconcile — config drift since the workspace was first built
@@ -19,34 +19,36 @@
 //! are left in place rather than rolled back, since the user can just close
 //! the sidebar entry by hand if it's a mess.
 
-use super::client::{CmuxClient, CmuxError, SurfaceRef, shell_quote};
-use super::config::{RepoCmuxConfig, SplitDirection};
+use super::client::{CmuxClient, CmuxError, SplitDirection, SurfaceRef, shell_quote};
 use std::path::{Path, PathBuf};
 
-/// CMux internally clamps every divider position to this range; matching the
-/// bound here keeps our iteration from spinning against the clamp.
-const RESIZE_RATIO_MIN: f32 = 0.1;
-const RESIZE_RATIO_MAX: f32 = 0.9;
-
-/// First-pass guess at the split's axis size, used to compute the initial
-/// `amount` in pixels. CMux's response is self-describing (it reports the
-/// old/new divider positions), so even a wrong guess converges to within
-/// fractions of a percent on the corrective second call.
-const RESIZE_INITIAL_AXIS_PIXELS_GUESS: f32 = 1200.0;
-
-/// Stop iterating once the achieved ratio is within this much of the target.
-const RESIZE_TOLERANCE: f32 = 0.005;
-
-/// Up to two `pane.resize` calls per split: one with a guess, one corrective
-/// using the real axis size derived from the first response.
-const RESIZE_MAX_ATTEMPTS: usize = 2;
-
-/// One repo's contribution to the workspace.
+/// One repo's contribution to the workspace's top row.
 #[derive(Debug, Clone)]
 pub struct Contributor {
     pub repo: String,
     pub worktree_path: PathBuf,
-    pub layout: RepoCmuxConfig,
+    /// The repo's `editor` command. `None`/empty means the pane just `cd`s
+    /// into the worktree with no command autostarting.
+    pub editor_cmd: Option<String>,
+    /// Extra idle tabs (CMux surfaces) stacked behind the editor surface,
+    /// each `cd`'d into the same worktree with nothing autostarting.
+    pub additional_panels: u32,
+}
+
+/// Task-level layout inputs, orthogonal to workspace-adoption behavior
+/// ([`BuildOptions`]).
+#[derive(Debug, Clone)]
+pub struct WorkspaceSpec {
+    /// Root folder for the task, visible to every repo it was started with.
+    /// The bottom pane's agent command runs here.
+    pub task_root: PathBuf,
+    /// Command for the bottom pane. `None` means no bottom pane is built.
+    pub agent_cmd: Option<String>,
+    /// When `true`, the top row is built (one pane per contributor running
+    /// its `editor_cmd`). When `false` (detached editors), no top row is
+    /// built — editors are expected to have been spawned as detached
+    /// processes elsewhere.
+    pub editors_attached: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +63,8 @@ pub enum BuildOutcome {
     /// tell the user we took over their current sidebar entry instead of
     /// opening a new one.
     Adopted { workspace_id: String, name: String },
-    /// No contributors → no workspace touched.
+    /// Nothing to show — no top row (editors not attached, or zero
+    /// contributors) and no agent command configured.
     NoContributors,
 }
 
@@ -139,15 +142,24 @@ pub fn color_for_task(task_id: &str) -> &'static str {
     PALETTE[(h as usize) % PALETTE.len()]
 }
 
+/// Whether the layout has anything to build at all. Exposed so callers can
+/// short-circuit before connecting to CMux at all.
+pub fn has_content(contributors: &[Contributor], spec: &WorkspaceSpec) -> bool {
+    let has_top = spec.editors_attached && !contributors.is_empty();
+    let has_bottom = spec.agent_cmd.is_some();
+    has_top || has_bottom
+}
+
 /// Build (or reuse) the workspace for this task.
 pub fn build_workspace(
     client: &mut dyn CmuxClient,
     task_id: &str,
     title: Option<&str>,
     contributors: &[Contributor],
+    spec: &WorkspaceSpec,
     options: BuildOptions,
 ) -> Result<BuildOutcome, CmuxError> {
-    if contributors.is_empty() {
+    if !has_content(contributors, spec) {
         return Ok(BuildOutcome::NoContributors);
     }
 
@@ -168,9 +180,15 @@ pub fn build_workspace(
     // simple. Any failure or ambiguity falls through to the create path.
     if options.replace_simple_workspace && !options.force_new_workspace {
         if let Some(current_id) = current_workspace_id() {
-            if let Some(adopted) =
-                try_adopt_workspace(client, &existing, &current_id, task_id, &name, contributors)?
-            {
+            if let Some(adopted) = try_adopt_workspace(
+                client,
+                &existing,
+                &current_id,
+                task_id,
+                &name,
+                contributors,
+                spec,
+            )? {
                 return Ok(adopted);
             }
         }
@@ -181,7 +199,7 @@ pub fn build_workspace(
     // other CMux call — surfaced via the caller's `CmuxOutcome`.
     client.set_workspace_color(&created.workspace_id, color_for_task(task_id))?;
 
-    populate_workspace(client, &created.initial_surface, contributors)?;
+    populate_workspace(client, &created.initial_surface, contributors, spec)?;
     client.select_workspace(&created.workspace_id)?;
 
     Ok(BuildOutcome::Created {
@@ -190,18 +208,15 @@ pub fn build_workspace(
     })
 }
 
-/// Lay out one slot per contributor, anchored at `seed_surface`. The seed
-/// becomes the first repo's slot; subsequent repos split off the previous
-/// slot to the right. Within each slot the repo's own `panes` layout fans
-/// out via [`build_repo_in_slot`]. After population the first surface is
-/// focused so a user naturally lands there.
-fn populate_workspace(
+/// Fan repos out left-to-right off `seed`, one pane per contributor, each
+/// running its `editor_cmd`. Returns the created slots in repo order.
+fn fan_out_repos(
     client: &mut dyn CmuxClient,
-    seed_surface: &SurfaceRef,
+    seed: &SurfaceRef,
     contributors: &[Contributor],
-) -> Result<(), CmuxError> {
+) -> Result<Vec<SurfaceRef>, CmuxError> {
     let mut slots: Vec<SurfaceRef> = Vec::with_capacity(contributors.len());
-    slots.push(seed_surface.clone());
+    slots.push(seed.clone());
     for prev_idx in 0..contributors.len().saturating_sub(1) {
         let anchor = slots[prev_idx].clone();
         client.focus_surface(&anchor.surface_id)?;
@@ -210,10 +225,55 @@ fn populate_workspace(
     }
 
     for (slot, contributor) in slots.iter().zip(contributors) {
-        build_repo_in_slot(client, slot, contributor)?;
+        client.focus_surface(&slot.surface_id)?;
+        let cmd = pane_command(
+            &contributor.worktree_path,
+            contributor.editor_cmd.as_deref(),
+        );
+        client.send(&slot.surface_id, &cmd)?;
+
+        for _ in 0..contributor.additional_panels {
+            let tab = client.new_surface(&slot.pane_id)?;
+            let tab_cmd = pane_command(&contributor.worktree_path, None);
+            client.send(&tab.surface_id, &tab_cmd)?;
+        }
+        if contributor.additional_panels > 0 {
+            // Bring the foreground editor surface back into focus after
+            // stacking the extra idle tabs behind it.
+            client.focus_surface(&slot.surface_id)?;
+        }
     }
 
-    client.focus_surface(&slots[0].surface_id)?;
+    Ok(slots)
+}
+
+/// Lay out the workspace anchored at `seed_surface`, following `spec`:
+/// top row of repo editors, bottom agent pane, or just one of the two.
+fn populate_workspace(
+    client: &mut dyn CmuxClient,
+    seed_surface: &SurfaceRef,
+    contributors: &[Contributor],
+    spec: &WorkspaceSpec,
+) -> Result<(), CmuxError> {
+    let has_top = spec.editors_attached && !contributors.is_empty();
+    let has_bottom = spec.agent_cmd.is_some();
+
+    if has_top && has_bottom {
+        client.focus_surface(&seed_surface.surface_id)?;
+        let bottom = client.new_split(&seed_surface.surface_id, SplitDirection::Down)?;
+        let top_slots = fan_out_repos(client, seed_surface, contributors)?;
+        let agent_text = pane_command(&spec.task_root, spec.agent_cmd.as_deref());
+        client.send(&bottom.surface_id, &agent_text)?;
+        client.focus_surface(&top_slots[0].surface_id)?;
+    } else if has_top {
+        let top_slots = fan_out_repos(client, seed_surface, contributors)?;
+        client.focus_surface(&top_slots[0].surface_id)?;
+    } else {
+        // has_bottom only — the caller already verified has_top || has_bottom.
+        let agent_text = pane_command(&spec.task_root, spec.agent_cmd.as_deref());
+        client.send(&seed_surface.surface_id, &agent_text)?;
+        client.focus_surface(&seed_surface.surface_id)?;
+    }
     Ok(())
 }
 
@@ -221,6 +281,7 @@ fn populate_workspace(
 /// `Ok(Some(Adopted))` on success, `Ok(None)` when the workspace doesn't
 /// exist on the CMux side or isn't simple enough to adopt, or `Err(...)`
 /// if a CMux call genuinely failed.
+#[allow(clippy::too_many_arguments)]
 fn try_adopt_workspace(
     client: &mut dyn CmuxClient,
     existing: &[super::client::Workspace],
@@ -228,6 +289,7 @@ fn try_adopt_workspace(
     task_id: &str,
     name: &str,
     contributors: &[Contributor],
+    spec: &WorkspaceSpec,
 ) -> Result<Option<BuildOutcome>, CmuxError> {
     // The env var should always point at one of the listed workspaces; if
     // it doesn't (e.g. CMux closed it from under us), fall back to create
@@ -243,7 +305,7 @@ fn try_adopt_workspace(
 
     client.rename_workspace(current_id, name)?;
     client.set_workspace_color(current_id, color_for_task(task_id))?;
-    populate_workspace(client, &seed, contributors)?;
+    populate_workspace(client, &seed, contributors, spec)?;
     client.select_workspace(current_id)?;
 
     Ok(Some(BuildOutcome::Adopted {
@@ -280,153 +342,16 @@ fn simple_workspace_surface(surfaces: &[super::client::SurfaceInfo]) -> Option<S
     Some(only.surface_ref.clone())
 }
 
-fn build_repo_in_slot(
-    client: &mut dyn CmuxClient,
-    slot: &SurfaceRef,
-    contributor: &Contributor,
-) -> Result<(), CmuxError> {
-    let panes = &contributor.layout.panes;
-    let Some(first) = panes.first() else {
-        return Ok(());
-    };
-
-    // First pane: the slot's initial surface.
-    client.focus_surface(&slot.surface_id)?;
-    let cmd = pane_command(&contributor.worktree_path, first.cmd.as_deref());
-    client.send(&slot.surface_id, &cmd)?;
-    for tab in &first.tabs {
-        let tab_ref = client.new_surface(&slot.pane_id)?;
-        let tab_cmd = pane_command(&contributor.worktree_path, tab.cmd.as_deref());
-        client.send(&tab_ref.surface_id, &tab_cmd)?;
-    }
-    // Bring the foreground tab back into focus after stacking tabs behind it.
-    if !first.tabs.is_empty() {
-        client.focus_surface(&slot.surface_id)?;
-    }
-
-    // Subsequent panes — each splits off the previous one.
-    let mut anchor: SurfaceRef = slot.clone();
-    for pane in &panes[1..] {
-        let direction = pane.split.unwrap_or(SplitDirection::Right);
-        client.focus_surface(&anchor.surface_id)?;
-        let new_pane = client.new_split(&anchor.surface_id, direction)?;
-        // Resize is best-effort: if the CMux build doesn't support
-        // `pane.resize` (older builds) or the call fails for any reason,
-        // we keep the default 50/50 split and continue laying out the rest
-        // of the workspace.
-        if let Some(target) = pane.size {
-            let _ = apply_pane_size(client, &anchor, &new_pane, direction, target);
-        }
-        let cmd = pane_command(&contributor.worktree_path, pane.cmd.as_deref());
-        client.send(&new_pane.surface_id, &cmd)?;
-        for tab in &pane.tabs {
-            let tab_ref = client.new_surface(&new_pane.pane_id)?;
-            let tab_cmd = pane_command(&contributor.worktree_path, tab.cmd.as_deref());
-            client.send(&tab_ref.surface_id, &tab_cmd)?;
-        }
-        if !pane.tabs.is_empty() {
-            client.focus_surface(&new_pane.surface_id)?;
-        }
-        anchor = new_pane;
-    }
-
-    Ok(())
-}
-
-/// Adjust the divider of a freshly created split so the new pane occupies
-/// roughly `target` of the split axis.
-///
-/// CMux's `pane.resize` is a *delta in pixels* against the split's axis
-/// size; it doesn't expose a "set divider to X" primitive. We do up to two
-/// passes:
-///
-/// 1. First call: guess axis pixels. Compute `amount` from the requested
-///    ratio delta and send the resize.
-/// 2. Read the response's old/new divider positions. If the divider didn't
-///    move at all (clamped or method unsupported) or we're already close
-///    enough, stop. Otherwise derive the real axis pixel size from the
-///    observed delta and send a corrective resize.
-///
-/// Which pane and direction to nudge depends on whether we're growing or
-/// shrinking the new pane: CMux only accepts `amount > 0` and requires the
-/// target pane to actually have an edge on the requested side.
-fn apply_pane_size(
-    client: &mut dyn CmuxClient,
-    anchor: &SurfaceRef,
-    new_pane: &SurfaceRef,
-    split: SplitDirection,
-    target: f32,
-) -> Result<(), CmuxError> {
-    let target = target.clamp(RESIZE_RATIO_MIN, RESIZE_RATIO_MAX);
-    let mut current_new_ratio: f32 = 0.5;
-    let mut axis_pixels = RESIZE_INITIAL_AXIS_PIXELS_GUESS;
-
-    for _ in 0..RESIZE_MAX_ATTEMPTS {
-        let delta = target - current_new_ratio;
-        if delta.abs() < RESIZE_TOLERANCE {
-            return Ok(());
-        }
-
-        // To grow the new pane we move the divider away from it, which
-        // means resizing the new pane in the direction opposite to the
-        // split. To shrink the new pane we resize the anchor (original
-        // pane) in the split direction, since `amount` must stay positive.
-        let (target_pane, direction) = if delta > 0.0 {
-            (new_pane, opposite(split))
-        } else {
-            (anchor, split)
-        };
-
-        let amount = (delta.abs() * axis_pixels).round() as i32;
-        if amount <= 0 {
-            return Ok(());
-        }
-
-        let outcome = client.resize_pane(&target_pane.pane_id, direction, amount)?;
-        let observed = (outcome.new_divider_position - outcome.old_divider_position).abs();
-
-        // If the divider didn't budge, we're either against the [0.1, 0.9]
-        // clamp or the call was a no-op; either way more iteration won't
-        // help.
-        if observed < f32::EPSILON {
-            return Ok(());
-        }
-
-        // Refine axis-pixel size from the actual observed delta so the next
-        // attempt is accurate to within rounding.
-        axis_pixels = amount as f32 / observed;
-
-        // For right/down splits the new pane is the second child of the
-        // split, so its ratio is `1 - divider`. For left/up the new pane is
-        // the first child, so its ratio equals the divider position.
-        current_new_ratio = match split {
-            SplitDirection::Right | SplitDirection::Down => 1.0 - outcome.new_divider_position,
-            SplitDirection::Left | SplitDirection::Up => outcome.new_divider_position,
-        };
-    }
-
-    Ok(())
-}
-
-fn opposite(d: SplitDirection) -> SplitDirection {
-    match d {
-        SplitDirection::Left => SplitDirection::Right,
-        SplitDirection::Right => SplitDirection::Left,
-        SplitDirection::Up => SplitDirection::Down,
-        SplitDirection::Down => SplitDirection::Up,
-    }
-}
-
 /// Build the shell snippet sent to a pane. Leading space exploits
 /// `HISTCONTROL=ignorespace` to keep the cd line out of shell history; the
 /// cd command itself uses single-quoted shell-quoting so paths with spaces
-/// or special characters survive intact. A `None` command produces just the
-/// cd — the pane lands on a shell prompt rooted in the worktree, nothing
-/// autostarting.
+/// or special characters survive intact. A `None`/empty command produces
+/// just the cd — the pane lands on a shell prompt rooted in the worktree,
+/// nothing autostarting.
 fn pane_command(worktree: &Path, cmd: Option<&str>) -> String {
     let path = worktree.to_string_lossy();
     let quoted = shell_quote(&path);
-    match cmd {
+    match cmd.filter(|c| !c.is_empty()) {
         Some(c) => format!(" cd {quoted} && {c}\n"),
         None => format!(" cd {quoted}\n"),
     }
@@ -474,51 +399,76 @@ mod tests {
     use super::*;
     use crate::cmux::client::Workspace;
     use crate::cmux::client::testing::{Call, RecordingClient};
-    use crate::cmux::config::{PaneSpec, TabSpec};
     use std::path::PathBuf;
 
-    fn contributor(name: &str, worktree: &str, panes: Vec<PaneSpec>) -> Contributor {
+    fn contributor(name: &str, worktree: &str, editor_cmd: Option<&str>) -> Contributor {
         Contributor {
             repo: name.into(),
             worktree_path: PathBuf::from(worktree),
-            layout: RepoCmuxConfig { panes },
+            editor_cmd: editor_cmd.map(String::from),
+            additional_panels: 0,
         }
     }
 
-    fn pane(cmd: &str) -> PaneSpec {
-        PaneSpec {
-            cmd: Some(cmd.into()),
-            split: None,
-            size: None,
-            tabs: Vec::new(),
+    fn contributor_with_panels(
+        name: &str,
+        worktree: &str,
+        editor_cmd: Option<&str>,
+        additional_panels: u32,
+    ) -> Contributor {
+        Contributor {
+            additional_panels,
+            ..contributor(name, worktree, editor_cmd)
         }
     }
 
-    fn pane_split(cmd: &str, dir: SplitDirection) -> PaneSpec {
-        PaneSpec {
-            cmd: Some(cmd.into()),
-            split: Some(dir),
-            size: None,
-            tabs: Vec::new(),
+    fn attached_spec(task_root: &str, agent_cmd: Option<&str>) -> WorkspaceSpec {
+        WorkspaceSpec {
+            task_root: PathBuf::from(task_root),
+            agent_cmd: agent_cmd.map(String::from),
+            editors_attached: true,
         }
     }
 
-    fn pane_split_size(cmd: &str, dir: SplitDirection, size: f32) -> PaneSpec {
-        PaneSpec {
-            cmd: Some(cmd.into()),
-            split: Some(dir),
-            size: Some(size),
-            tabs: Vec::new(),
+    fn detached_spec(task_root: &str, agent_cmd: Option<&str>) -> WorkspaceSpec {
+        WorkspaceSpec {
+            task_root: PathBuf::from(task_root),
+            agent_cmd: agent_cmd.map(String::from),
+            editors_attached: false,
         }
     }
 
     #[test]
-    fn no_contributors_short_circuits_without_calls() {
+    fn no_content_short_circuits_without_calls() {
         let mut client = RecordingClient::new();
+        let spec = detached_spec("/csw/tasks/alice-PROJ-1", None);
         let outcome =
-            build_workspace(&mut client, "PROJ-1", None, &[], BuildOptions::default()).unwrap();
+            build_workspace(&mut client, "PROJ-1", None, &[], &spec, BuildOptions::default())
+                .unwrap();
         assert_eq!(outcome, BuildOutcome::NoContributors);
         assert!(client.calls().is_empty());
+    }
+
+    #[test]
+    fn detached_with_no_editors_and_no_agent_is_no_contributors() {
+        let mut client = RecordingClient::new();
+        let contribs = vec![contributor(
+            "fe",
+            "/csw/tasks/alice-PROJ-1/fe",
+            Some("pnpm dev"),
+        )];
+        let spec = detached_spec("/csw/tasks/alice-PROJ-1", None);
+        let outcome = build_workspace(
+            &mut client,
+            "PROJ-1",
+            None,
+            &contribs,
+            &spec,
+            BuildOptions::default(),
+        )
+        .unwrap();
+        // Detached editors never build a top row regardless of contributors.
+        assert_eq!(outcome, BuildOutcome::NoContributors);
     }
 
     #[test]
@@ -527,17 +477,15 @@ mod tests {
             id: "ws-existing".into(),
             name: "PROJ-1".into(),
         }]);
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![pane("ls")],
-        )];
+        let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
+        let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
 
         let outcome = build_workspace(
             &mut client,
             "PROJ-1",
             None,
             &contribs,
+            &spec,
             BuildOptions::default(),
         )
         .unwrap();
@@ -551,24 +499,19 @@ mod tests {
 
     #[test]
     fn existing_workspace_is_reused_when_only_task_id_matches() {
-        // The workspace was created on a prior run with a title; the resume
-        // call doesn't supply one. We should still find and focus it via
-        // the task-id prefix rule, not create a duplicate.
         let mut client = RecordingClient::new().with_existing(vec![Workspace {
             id: "ws-with-title".into(),
             name: "PROJ-1 · Fix navbar bug".into(),
         }]);
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![pane("ls")],
-        )];
+        let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
+        let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
 
         let outcome = build_workspace(
             &mut client,
             "PROJ-1",
             None,
             &contribs,
+            &spec,
             BuildOptions::default(),
         )
         .unwrap();
@@ -606,49 +549,21 @@ mod tests {
         let a = color_for_task("PROJ-1");
         let b = color_for_task("PROJ-1");
         assert_eq!(a, b, "same task should always produce the same color");
-        // Must start with #; all palette entries are 7 chars #RRGGBB.
         assert!(a.starts_with('#') && a.len() == 7, "got {a}");
-    }
-
-    #[test]
-    fn workspace_create_applies_deterministic_color() {
-        let mut client = RecordingClient::new();
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![pane("ls")],
-        )];
-
-        build_workspace(
-            &mut client,
-            "PROJ-1",
-            None,
-            &contribs,
-            BuildOptions::default(),
-        )
-        .unwrap();
-
-        let color_call = client.calls().into_iter().find_map(|c| match c {
-            Call::SetColor { color, .. } => Some(color),
-            _ => None,
-        });
-        assert_eq!(color_call.as_deref(), Some(color_for_task("PROJ-1")));
     }
 
     #[test]
     fn workspace_create_uses_title_when_provided() {
         let mut client = RecordingClient::new();
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![pane("ls")],
-        )];
+        let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
+        let spec = attached_spec("/csw/tasks/alice-PROJ-1", None);
 
         build_workspace(
             &mut client,
             "PROJ-1",
             Some("Fix navbar bug"),
             &contribs,
+            &spec,
             BuildOptions::default(),
         )
         .unwrap();
@@ -661,446 +576,32 @@ mod tests {
     }
 
     #[test]
-    fn single_repo_single_pane_sends_one_command() {
+    fn attached_single_repo_no_agent_sends_editor_only() {
         let mut client = RecordingClient::new();
         let contribs = vec![contributor(
             "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![pane("pnpm dev")],
+            "/csw/tasks/alice-PROJ-1/fe",
+            Some("pnpm dev"),
         )];
-
-        let outcome = build_workspace(
-            &mut client,
-            "PROJ-1",
-            None,
-            &contribs,
-            BuildOptions::default(),
-        )
-        .unwrap();
-        assert!(matches!(outcome, BuildOutcome::Created { .. }));
-
-        let calls = client.calls();
-        // Expect: list, new_workspace, set_color, focus(initial),
-        // send(initial,...), focus(initial) [final], select_workspace.
-        assert!(matches!(calls[0], Call::ListWorkspaces));
-        assert!(matches!(calls[1], Call::NewWorkspace { ref title } if title == "PROJ-1"));
-        assert!(matches!(calls[2], Call::SetColor { .. }));
-        let send = calls
-            .iter()
-            .find_map(|c| match c {
-                Call::Send { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .unwrap();
-        assert!(send.starts_with(" cd "));
-        assert!(send.contains("/csw/tasks/fe/alice-PROJ-1"));
-        assert!(send.ends_with("pnpm dev\n"));
-    }
-
-    #[test]
-    fn two_repos_create_left_to_right_slots() {
-        let mut client = RecordingClient::new();
-        let contribs = vec![
-            contributor("fe", "/csw/tasks/fe/alice-PROJ-1", vec![pane("pnpm dev")]),
-            contributor("be", "/csw/tasks/be/alice-PROJ-1", vec![pane("pnpm dev")]),
-        ];
+        let spec = attached_spec("/csw/tasks/alice-PROJ-1", None);
 
         build_workspace(
             &mut client,
             "PROJ-1",
             None,
             &contribs,
+            &spec,
             BuildOptions::default(),
         )
         .unwrap();
 
-        // The first inter-repo split should be a right-split off the first
-        // (initial) slot.
-        let calls = client.calls();
-        let first_split = calls
-            .iter()
-            .find_map(|c| match c {
-                Call::NewSplit { anchor, direction } => Some((anchor.clone(), *direction)),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(first_split.1, SplitDirection::Right);
-        // Anchor was the initial surface.
-        assert!(first_split.0.starts_with("surface-"));
-    }
-
-    #[test]
-    fn pane_with_split_right_creates_split_to_anchor() {
-        let mut client = RecordingClient::new();
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![
-                pane("pnpm dev"),
-                pane_split("claude", SplitDirection::Right),
-            ],
-        )];
-
-        build_workspace(
-            &mut client,
-            "PROJ-1",
-            None,
-            &contribs,
-            BuildOptions::default(),
-        )
-        .unwrap();
-
-        let splits: Vec<_> = client
-            .calls()
-            .into_iter()
-            .filter_map(|c| match c {
-                Call::NewSplit { anchor, direction } => Some((anchor, direction)),
-                _ => None,
-            })
-            .collect();
-        // Only one split since it's a single-repo task with two panes.
-        assert_eq!(splits.len(), 1);
-        assert_eq!(splits[0].1, SplitDirection::Right);
-    }
-
-    #[test]
-    fn pane_without_size_does_not_call_resize() {
-        let mut client = RecordingClient::new();
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![
-                pane("pnpm dev"),
-                pane_split("claude", SplitDirection::Right),
-            ],
-        )];
-
-        build_workspace(
-            &mut client,
-            "PROJ-1",
-            None,
-            &contribs,
-            BuildOptions::default(),
-        )
-        .unwrap();
-
+        // No down-split since there's no agent to seat at the bottom.
         assert!(
             !client
                 .calls()
                 .iter()
-                .any(|c| matches!(c, Call::ResizePane { .. }))
+                .any(|c| matches!(c, Call::NewSplit { direction: SplitDirection::Down, .. }))
         );
-    }
-
-    #[test]
-    fn pane_with_size_emits_resize_on_new_pane() {
-        // simulated_axis_pixels = 1600; target 0.7 → need to grow new pane
-        // from 0.5 to 0.7 → 0.2 of axis → 320 px first call. Initial guess
-        // of 1200 → first amount = 240. After first call the helper derives
-        // the real axis (1600) and corrects with a second call.
-        let mut client = RecordingClient::new().with_simulated_axis_pixels(1600.0);
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![
-                pane("pnpm dev"),
-                pane_split_size("claude", SplitDirection::Right, 0.7),
-            ],
-        )];
-
-        build_workspace(
-            &mut client,
-            "PROJ-1",
-            None,
-            &contribs,
-            BuildOptions::default(),
-        )
-        .unwrap();
-
-        let resizes: Vec<_> = client
-            .calls()
-            .into_iter()
-            .filter_map(|c| match c {
-                Call::ResizePane {
-                    pane,
-                    direction,
-                    amount,
-                } => Some((pane, direction, amount)),
-                _ => None,
-            })
-            .collect();
-
-        assert!(!resizes.is_empty(), "expected at least one ResizePane call");
-        // Growing the right-pane means resizing it leftward.
-        assert!(
-            resizes
-                .iter()
-                .all(|(_, dir, _)| *dir == SplitDirection::Left)
-        );
-        // All resize calls target the new pane (the split's second child).
-        let first_pane = &resizes[0].0;
-        assert!(resizes.iter().all(|(p, _, _)| p == first_pane));
-        // First call uses the initial guess (1200 * 0.2 = 240).
-        assert_eq!(resizes[0].2, 240);
-        // Second corrective call should be small (axis derived to 1600,
-        // remaining gap 0.2 - 0.15 = 0.05, → 0.05 * 1600 = 80).
-        if resizes.len() > 1 {
-            assert!(
-                resizes[1].2 > 0 && resizes[1].2 < 240,
-                "got {}",
-                resizes[1].2
-            );
-        }
-    }
-
-    #[test]
-    fn pane_size_below_half_resizes_anchor_in_split_direction() {
-        // Target < 0.5 → shrink new pane → resize anchor in split direction.
-        let mut client = RecordingClient::new().with_simulated_axis_pixels(1600.0);
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![
-                pane("pnpm dev"),
-                pane_split_size("claude", SplitDirection::Right, 0.3),
-            ],
-        )];
-
-        build_workspace(
-            &mut client,
-            "PROJ-1",
-            None,
-            &contribs,
-            BuildOptions::default(),
-        )
-        .unwrap();
-
-        let resize_directions: Vec<SplitDirection> = client
-            .calls()
-            .into_iter()
-            .filter_map(|c| match c {
-                Call::ResizePane { direction, .. } => Some(direction),
-                _ => None,
-            })
-            .collect();
-
-        assert!(!resize_directions.is_empty());
-        // Shrinking the right new pane → resize the anchor (left, original
-        // pane) in the split direction ("right" pushes the divider right,
-        // which makes the new pane narrower).
-        assert!(
-            resize_directions
-                .iter()
-                .all(|d| *d == SplitDirection::Right)
-        );
-    }
-
-    #[test]
-    fn pane_size_with_down_split_targets_vertical_axis() {
-        // Sanity-check the vertical case: split = "down", target 0.7 (new
-        // bottom pane gets 70% height). Growth direction = "up".
-        let mut client = RecordingClient::new().with_simulated_axis_pixels(1600.0);
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![
-                pane("pnpm dev"),
-                pane_split_size("claude", SplitDirection::Down, 0.7),
-            ],
-        )];
-
-        build_workspace(
-            &mut client,
-            "PROJ-1",
-            None,
-            &contribs,
-            BuildOptions::default(),
-        )
-        .unwrap();
-
-        let resize_directions: Vec<SplitDirection> = client
-            .calls()
-            .into_iter()
-            .filter_map(|c| match c {
-                Call::ResizePane { direction, .. } => Some(direction),
-                _ => None,
-            })
-            .collect();
-
-        assert!(!resize_directions.is_empty());
-        assert!(resize_directions.iter().all(|d| *d == SplitDirection::Up));
-    }
-
-    #[test]
-    fn pane_size_out_of_range_is_clamped() {
-        // Asking for 0.99 should clamp to 0.9 internally; we still get a
-        // resize call (the new pane needs to grow from 0.5).
-        let mut client = RecordingClient::new().with_simulated_axis_pixels(1600.0);
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![
-                pane("pnpm dev"),
-                pane_split_size("claude", SplitDirection::Right, 0.99),
-            ],
-        )];
-
-        build_workspace(
-            &mut client,
-            "PROJ-1",
-            None,
-            &contribs,
-            BuildOptions::default(),
-        )
-        .unwrap();
-
-        let max_amount = client
-            .calls()
-            .into_iter()
-            .filter_map(|c| match c {
-                Call::ResizePane { amount, .. } => Some(amount),
-                _ => None,
-            })
-            .max()
-            .expect("expected a resize call");
-        // 0.9 - 0.5 = 0.4 of axis. First-call guess = 0.4 * 1200 = 480.
-        // We must not have produced an amount that targets 0.99 (which
-        // would be 0.49 * something).
-        assert!(max_amount <= 480, "got {max_amount}");
-    }
-
-    #[test]
-    fn pane_size_converges_to_target_after_two_attempts() {
-        // Direct test of the iterative helper: given a known simulated axis
-        // pixel size that disagrees with our initial guess, the helper
-        // should still land within RESIZE_TOLERANCE of the target on the
-        // second pass.
-        let mut client = RecordingClient::new().with_simulated_axis_pixels(1600.0);
-        let anchor = SurfaceRef {
-            surface_id: "surface-anchor".into(),
-            pane_id: "pane-anchor".into(),
-        };
-        let new_pane = SurfaceRef {
-            surface_id: "surface-new".into(),
-            pane_id: "pane-new".into(),
-        };
-
-        apply_pane_size(&mut client, &anchor, &new_pane, SplitDirection::Right, 0.7).unwrap();
-
-        // The mock tracks divider state per pane. After both calls, the
-        // tracked divider for the new pane should produce a new-pane ratio
-        // very close to 0.7. New pane is the second child for a right
-        // split, so ratio = 1 - divider.
-        let divider = client.divider_for(&new_pane.pane_id).unwrap_or(0.5);
-        let achieved = 1.0 - divider;
-        assert!(
-            (achieved - 0.7).abs() < 0.01,
-            "expected ~0.7, got {achieved} (divider={divider})"
-        );
-    }
-
-    #[test]
-    fn pane_size_target_near_50_50_makes_no_call() {
-        // Target within tolerance of 0.5 → no resize needed (we open at
-        // 0.5 already).
-        let mut client = RecordingClient::new();
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![
-                pane("pnpm dev"),
-                pane_split_size("claude", SplitDirection::Right, 0.5),
-            ],
-        )];
-
-        build_workspace(
-            &mut client,
-            "PROJ-1",
-            None,
-            &contribs,
-            BuildOptions::default(),
-        )
-        .unwrap();
-        assert!(
-            !client
-                .calls()
-                .iter()
-                .any(|c| matches!(c, Call::ResizePane { .. }))
-        );
-    }
-
-    #[test]
-    fn pane_with_tabs_creates_new_surface_per_tab() {
-        let mut client = RecordingClient::new();
-        let mut pane = pane("pnpm dev");
-        pane.tabs = vec![
-            TabSpec {
-                cmd: Some("sh".into()),
-            },
-            TabSpec {
-                cmd: Some("less log".into()),
-            },
-        ];
-        let contribs = vec![contributor("fe", "/csw/tasks/fe/alice-PROJ-1", vec![pane])];
-
-        build_workspace(
-            &mut client,
-            "PROJ-1",
-            None,
-            &contribs,
-            BuildOptions::default(),
-        )
-        .unwrap();
-
-        let new_surfaces: Vec<_> = client
-            .calls()
-            .into_iter()
-            .filter_map(|c| match c {
-                Call::NewSurface { pane } => Some(pane),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(new_surfaces.len(), 2, "expected 2 new surfaces for 2 tabs");
-    }
-
-    #[test]
-    fn pane_command_uses_leading_space_and_shell_quoting() {
-        let s = pane_command(Path::new("/path with spaces"), Some("cmd"));
-        assert!(s.starts_with(" cd '"), "leading space + single quote: {s}");
-        assert!(s.contains("/path with spaces"));
-        assert!(s.ends_with("cmd\n"));
-    }
-
-    #[test]
-    fn pane_command_without_cmd_just_cds() {
-        let s = pane_command(Path::new("/csw/tasks/fe/alice-PROJ-1"), None);
-        assert_eq!(s, " cd '/csw/tasks/fe/alice-PROJ-1'\n");
-    }
-
-    #[test]
-    fn pane_without_cmd_still_sends_cd() {
-        let mut client = RecordingClient::new();
-        let bare_pane = PaneSpec {
-            cmd: None,
-            split: None,
-            size: None,
-            tabs: Vec::new(),
-        };
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![bare_pane],
-        )];
-
-        build_workspace(
-            &mut client,
-            "PROJ-1",
-            None,
-            &contribs,
-            BuildOptions::default(),
-        )
-        .unwrap();
-
         let send = client
             .calls()
             .into_iter()
@@ -1109,10 +610,195 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        // No `&&` — just the cd, no command piggy-backing on it.
-        assert!(send.starts_with(" cd '"), "got: {send}");
-        assert!(!send.contains("&&"), "got: {send}");
-        assert!(send.ends_with("'\n"), "got: {send}");
+        assert!(send.contains("/csw/tasks/alice-PROJ-1/fe"));
+        assert!(send.ends_with("pnpm dev\n"));
+    }
+
+    #[test]
+    fn attached_with_agent_splits_down_first() {
+        let mut client = RecordingClient::new();
+        let contribs = vec![contributor(
+            "fe",
+            "/csw/tasks/alice-PROJ-1/fe",
+            Some("nvim"),
+        )];
+        let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
+
+        build_workspace(
+            &mut client,
+            "PROJ-1",
+            None,
+            &contribs,
+            &spec,
+            BuildOptions::default(),
+        )
+        .unwrap();
+
+        let down_splits: Vec<_> = client
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::NewSplit { direction: SplitDirection::Down, .. }))
+            .collect();
+        assert_eq!(down_splits.len(), 1, "expected exactly one down-split");
+
+        let sends: Vec<String> = client
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Send { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(sends.iter().any(|s| s.contains("nvim")));
+        assert!(
+            sends
+                .iter()
+                .any(|s| s.contains("/csw/tasks/alice-PROJ-1") && s.ends_with("claude\n"))
+        );
+    }
+
+    #[test]
+    fn two_repos_create_left_to_right_top_row() {
+        let mut client = RecordingClient::new();
+        let contribs = vec![
+            contributor("fe", "/csw/tasks/alice-PROJ-1/fe", Some("pnpm dev")),
+            contributor("be", "/csw/tasks/alice-PROJ-1/be", Some("pnpm dev")),
+        ];
+        let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
+
+        build_workspace(
+            &mut client,
+            "PROJ-1",
+            None,
+            &contribs,
+            &spec,
+            BuildOptions::default(),
+        )
+        .unwrap();
+
+        let right_splits: Vec<_> = client
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::NewSplit { direction: SplitDirection::Right, .. }))
+            .collect();
+        assert_eq!(right_splits.len(), 1, "two repos need exactly one right-split");
+    }
+
+    #[test]
+    fn additional_panels_open_extra_idle_tabs_behind_editor() {
+        let mut client = RecordingClient::new();
+        let contribs = vec![contributor_with_panels(
+            "fe",
+            "/csw/tasks/alice-PROJ-1/fe",
+            Some("nvim"),
+            2,
+        )];
+        let spec = attached_spec("/csw/tasks/alice-PROJ-1", None);
+
+        build_workspace(
+            &mut client,
+            "PROJ-1",
+            None,
+            &contribs,
+            &spec,
+            BuildOptions::default(),
+        )
+        .unwrap();
+
+        let new_surfaces: Vec<_> = client
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::NewSurface { .. }))
+            .collect();
+        assert_eq!(new_surfaces.len(), 2, "expected 2 extra idle tabs");
+
+        // The extra tabs just cd — no command appended.
+        let sends: Vec<String> = client
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Send { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sends.len(), 3, "editor send + 2 idle tab sends");
+        let idle_sends: Vec<&String> = sends.iter().filter(|s| !s.contains("nvim")).collect();
+        assert_eq!(idle_sends.len(), 2);
+        assert!(idle_sends.iter().all(|s| !s.contains("&&")));
+    }
+
+    #[test]
+    fn zero_additional_panels_opens_no_extra_tabs() {
+        let mut client = RecordingClient::new();
+        let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", Some("nvim"))];
+        let spec = attached_spec("/csw/tasks/alice-PROJ-1", None);
+
+        build_workspace(
+            &mut client,
+            "PROJ-1",
+            None,
+            &contribs,
+            &spec,
+            BuildOptions::default(),
+        )
+        .unwrap();
+
+        assert!(
+            !client
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::NewSurface { .. }))
+        );
+    }
+
+    #[test]
+    fn detached_editors_with_agent_builds_single_full_pane() {
+        let mut client = RecordingClient::new();
+        let contribs = vec![contributor(
+            "fe",
+            "/csw/tasks/alice-PROJ-1/fe",
+            Some("pnpm dev"),
+        )];
+        let spec = detached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
+
+        let outcome = build_workspace(
+            &mut client,
+            "PROJ-1",
+            None,
+            &contribs,
+            &spec,
+            BuildOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(outcome, BuildOutcome::Created { .. }));
+
+        // No splits at all — single full pane.
+        assert!(!client.calls().iter().any(|c| matches!(c, Call::NewSplit { .. })));
+        let send = client
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                Call::Send { text, .. } => Some(text),
+                _ => None,
+            })
+            .unwrap();
+        assert!(send.contains("/csw/tasks/alice-PROJ-1"));
+        assert!(send.ends_with("claude\n"));
+        assert!(!send.contains("pnpm dev"));
+    }
+
+    #[test]
+    fn pane_without_cmd_just_cds() {
+        let s = pane_command(Path::new("/csw/tasks/alice-PROJ-1/fe"), None);
+        assert_eq!(s, " cd '/csw/tasks/alice-PROJ-1/fe'\n");
+    }
+
+    #[test]
+    fn pane_command_uses_leading_space_and_shell_quoting() {
+        let s = pane_command(Path::new("/path with spaces"), Some("cmd"));
+        assert!(s.starts_with(" cd '"), "leading space + single quote: {s}");
+        assert!(s.contains("/path with spaces"));
+        assert!(s.ends_with("cmd\n"));
     }
 
     #[test]
@@ -1262,7 +948,6 @@ mod tests {
 
     #[test]
     fn simple_workspace_surface_rejects_multiple_surfaces_same_pane() {
-        // Two surfaces in one pane → multi-tab → not simple.
         let surfaces = vec![
             SurfaceInfo {
                 surface_ref: SurfaceRef {
@@ -1303,11 +988,8 @@ mod tests {
             .with_existing(vec![workspace.clone()])
             .with_workspace_surfaces("ws-current", vec![simple_surface("a")]);
 
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![pane("ls")],
-        )];
+        let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
+        let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
         let outcome = try_adopt_workspace(
             &mut client,
             std::slice::from_ref(&workspace),
@@ -1315,6 +997,7 @@ mod tests {
             "PROJ-1",
             "PROJ-1",
             &contribs,
+            &spec,
         )
         .unwrap();
 
@@ -1325,8 +1008,6 @@ mod tests {
         ));
 
         let calls = client.calls();
-        // The adoption path renames + recolors the existing workspace and
-        // never calls `workspace.create`.
         assert!(calls.iter().any(|c| matches!(
             c,
             Call::RenameWorkspace { id, title } if id == "ws-current" && title == "PROJ-1"
@@ -1339,38 +1020,6 @@ mod tests {
     }
 
     #[test]
-    fn try_adopt_workspace_uses_per_task_color_on_rename() {
-        let workspace = Workspace {
-            id: "ws-current".into(),
-            name: "scratch".into(),
-        };
-        let mut client = RecordingClient::new()
-            .with_existing(vec![workspace.clone()])
-            .with_workspace_surfaces("ws-current", vec![simple_surface("a")]);
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![pane("ls")],
-        )];
-
-        try_adopt_workspace(
-            &mut client,
-            std::slice::from_ref(&workspace),
-            "ws-current",
-            "PROJ-1",
-            "PROJ-1",
-            &contribs,
-        )
-        .unwrap();
-
-        let color = client.calls().into_iter().find_map(|c| match c {
-            Call::SetColor { color, .. } => Some(color),
-            _ => None,
-        });
-        assert_eq!(color.as_deref(), Some(color_for_task("PROJ-1")));
-    }
-
-    #[test]
     fn try_adopt_workspace_returns_none_when_current_id_unknown() {
         let workspace = Workspace {
             id: "ws-current".into(),
@@ -1379,11 +1028,8 @@ mod tests {
         let mut client = RecordingClient::new()
             .with_existing(vec![workspace.clone()])
             .with_workspace_surfaces("ws-current", vec![simple_surface("a")]);
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![pane("ls")],
-        )];
+        let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
+        let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
 
         let outcome = try_adopt_workspace(
             &mut client,
@@ -1392,10 +1038,10 @@ mod tests {
             "PROJ-1",
             "PROJ-1",
             &contribs,
+            &spec,
         )
         .unwrap();
         assert!(outcome.is_none());
-        // None of the mutation calls should have fired.
         assert!(
             !client
                 .calls()
@@ -1412,13 +1058,9 @@ mod tests {
         };
         let mut client = RecordingClient::new()
             .with_existing(vec![workspace.clone()])
-            // Two surfaces → not simple.
             .with_workspace_surfaces("ws-current", vec![simple_surface("a"), simple_surface("b")]);
-        let contribs = vec![contributor(
-            "fe",
-            "/csw/tasks/fe/alice-PROJ-1",
-            vec![pane("ls")],
-        )];
+        let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
+        let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
 
         let outcome = try_adopt_workspace(
             &mut client,
@@ -1427,6 +1069,7 @@ mod tests {
             "PROJ-1",
             "PROJ-1",
             &contribs,
+            &spec,
         )
         .unwrap();
         assert!(outcome.is_none());
@@ -1440,8 +1083,6 @@ mod tests {
 
     #[test]
     fn build_workspace_skips_adoption_when_option_disabled() {
-        // Even with a simple current workspace, replace_simple_workspace=false
-        // forces the create path.
         let workspace = Workspace {
             id: "ws-current".into(),
             name: "scratch".into(),
@@ -1451,16 +1092,14 @@ mod tests {
             let mut client = RecordingClient::new()
                 .with_existing(vec![workspace.clone()])
                 .with_workspace_surfaces("ws-current", vec![simple_surface("a")]);
-            let contribs = vec![contributor(
-                "fe",
-                "/csw/tasks/fe/alice-PROJ-1",
-                vec![pane("ls")],
-            )];
+            let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
+            let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
             let outcome = build_workspace(
                 &mut client,
                 "PROJ-1",
                 None,
                 &contribs,
+                &spec,
                 BuildOptions {
                     replace_simple_workspace: false,
                     force_new_workspace: false,
@@ -1490,16 +1129,14 @@ mod tests {
             let mut client = RecordingClient::new()
                 .with_existing(vec![workspace.clone()])
                 .with_workspace_surfaces("ws-current", vec![simple_surface("a")]);
-            let contribs = vec![contributor(
-                "fe",
-                "/csw/tasks/fe/alice-PROJ-1",
-                vec![pane("ls")],
-            )];
+            let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
+            let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
             let outcome = build_workspace(
                 &mut client,
                 "PROJ-1",
                 None,
                 &contribs,
+                &spec,
                 BuildOptions {
                     replace_simple_workspace: true,
                     force_new_workspace: true,
@@ -1529,13 +1166,11 @@ mod tests {
             let mut client = RecordingClient::new()
                 .with_existing(vec![workspace.clone()])
                 .with_workspace_surfaces("ws-current", vec![simple_surface("a")]);
-            let contribs = vec![contributor(
-                "fe",
-                "/csw/tasks/fe/alice-PROJ-1",
-                vec![pane("ls")],
-            )];
+            let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
+            let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
             let outcome =
-                build_workspace(&mut client, "PROJ-1", None, &contribs, adopt_options()).unwrap();
+                build_workspace(&mut client, "PROJ-1", None, &contribs, &spec, adopt_options())
+                    .unwrap();
             (outcome, client.calls())
         });
 
@@ -1553,8 +1188,6 @@ mod tests {
 
     #[test]
     fn build_workspace_reuse_by_name_wins_over_adoption() {
-        // The current workspace is simple, but a different workspace
-        // already matches the task id — reuse it instead of adopting.
         let existing_match = Workspace {
             id: "ws-existing".into(),
             name: "PROJ-1".into(),
@@ -1568,13 +1201,11 @@ mod tests {
             let mut client = RecordingClient::new()
                 .with_existing(vec![existing_match, current])
                 .with_workspace_surfaces("ws-current", vec![simple_surface("a")]);
-            let contribs = vec![contributor(
-                "fe",
-                "/csw/tasks/fe/alice-PROJ-1",
-                vec![pane("ls")],
-            )];
+            let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
+            let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
             let outcome =
-                build_workspace(&mut client, "PROJ-1", None, &contribs, adopt_options()).unwrap();
+                build_workspace(&mut client, "PROJ-1", None, &contribs, &spec, adopt_options())
+                    .unwrap();
             (outcome, client.calls())
         });
 
@@ -1582,7 +1213,6 @@ mod tests {
             outcome.0,
             BuildOutcome::Reused { ref workspace_id, .. } if workspace_id == "ws-existing"
         ));
-        // No rename or create on the current workspace.
         assert!(!outcome.1.iter().any(|c| matches!(
             c,
             Call::RenameWorkspace { id, .. } if id == "ws-current"

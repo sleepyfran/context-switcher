@@ -161,7 +161,6 @@ mod tests {
     use super::*;
     use crate::RepoConfig;
     use crate::ops::start::{self, StartRequest};
-    use crate::paths;
     use crate::progress::NullReporter;
     use crate::sidecar;
     use std::collections::BTreeMap;
@@ -192,6 +191,8 @@ mod tests {
                 tasks_dir,
                 username: Some("alice".into()),
                 default_repos: vec![],
+                agent: None,
+                detached_editor: true,
                 cmux: None,
                 repos: BTreeMap::new(),
             };
@@ -254,9 +255,7 @@ mod tests {
         }
 
         fn worktree_path(&self, repo: &str, task: &str) -> PathBuf {
-            self.cfg
-                .repo_tasks_dir(repo)
-                .join(paths::worktree_dirname(&self.user, task))
+            self.cfg.task_root(&self.user, task).join(repo)
         }
     }
 

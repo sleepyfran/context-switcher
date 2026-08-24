@@ -19,7 +19,6 @@
 //! ends up as a warn-and-continue at the call site. No CMux failure ever
 //! bumps csw's exit code.
 
-use super::config::SplitDirection;
 use serde::Deserialize;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -69,6 +68,28 @@ pub enum CmuxError {
 
     #[error("cmux response missing expected field `{0}`")]
     MissingField(&'static str),
+}
+
+/// Direction to split a pane. Internal to the CMux layout algorithm — no
+/// longer user-configurable, so this carries no serde derives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl SplitDirection {
+    /// CMux's socket API expects directional splits by these string tokens.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

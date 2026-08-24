@@ -103,6 +103,8 @@ mod tests {
                     tasks_dir,
                     username: None,
                     default_repos: vec![],
+                    agent: None,
+                    detached_editor: true,
                     cmux: None,
                     repos: BTreeMap::new(),
                 },
@@ -162,9 +164,7 @@ mod tests {
         }
 
         fn worktree(&self, repo: &str, task: &str) -> PathBuf {
-            self.cfg
-                .repo_tasks_dir(repo)
-                .join(paths::worktree_dirname("alice", task))
+            self.cfg.task_root("alice", task).join(repo)
         }
     }
 

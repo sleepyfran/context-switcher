@@ -7,7 +7,7 @@
 //!     returned [`StartReport`] but don't abort siblings — the caller decides
 //!     the exit code.
 
-use crate::cmux::{self, BuildOptions, CmuxOutcome, Contributor};
+use crate::cmux::{self, BuildOptions, CmuxOutcome, Contributor, WorkspaceSpec};
 use crate::errors::CswError;
 use crate::hooks::{self, HookContext};
 use crate::progress::{RepoProgress, Reporter};
@@ -45,7 +45,11 @@ pub enum StartAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorStatus {
+    /// Launched as a detached process (`detached_editor = true`).
     Spawned,
+    /// Will be launched as a CMux pane by the task-level `finalize_cmux`
+    /// step, once every repo has finished starting (the default).
+    Attached,
     Skipped,
     Failed(String),
 }
@@ -113,7 +117,7 @@ pub fn start(cfg: &Config, request: StartRequest, reporter: &dyn Reporter) -> Re
             StartAction::Resumed => "resuming",
         };
         let progress = reporter.begin(&plan.repo_name, action_label);
-        match execute(&request, &plan, progress.as_ref()) {
+        match execute(cfg, &request, &plan, progress.as_ref()) {
             Ok(success) => {
                 progress.ok(&format!(
                     "{} on {}",
@@ -154,7 +158,18 @@ fn finalize_cmux(cfg: &Config, request: &StartRequest, successes: &[StartSuccess
         replace_simple_workspace: cfg.cmux_replace_simple_workspace(),
         force_new_workspace: request.force_new_workspace,
     };
-    cmux::setup(&request.task_id, title.as_deref(), &contributors, options)
+    let spec = WorkspaceSpec {
+        task_root: cfg.task_root(&request.user, &request.task_id),
+        agent_cmd: cfg.agent.clone(),
+        editors_attached: !cfg.detached_editor,
+    };
+    cmux::setup(
+        &request.task_id,
+        title.as_deref(),
+        &contributors,
+        &spec,
+        options,
+    )
 }
 
 /// First non-empty title found in any success's sidecar, if any. Sidecars
@@ -167,22 +182,23 @@ fn sidecar_title(successes: &[StartSuccess]) -> Option<String> {
         .find(|t| !t.trim().is_empty())
 }
 
-/// Filter successful repos down to those that opt in to CMux participation
-/// — i.e. have a `cmux` block with at least one pane configured. Extracted
+/// Build one contributor per successfully started repo — every repo
+/// participates in the top row now (no more per-repo opt-in). Extracted
 /// from [`finalize_cmux`] so it can be unit-tested without env-var games.
 pub(crate) fn cmux_contributors(cfg: &Config, successes: &[StartSuccess]) -> Vec<Contributor> {
     successes
         .iter()
         .filter_map(|s| {
             let repo = cfg.repo(&s.repo)?;
-            let layout = repo.cmux.as_ref()?;
-            if !layout.participates() {
-                return None;
-            }
             Some(Contributor {
                 repo: s.repo.clone(),
                 worktree_path: s.worktree_path.clone(),
-                layout: layout.clone(),
+                editor_cmd: if repo.editor.is_empty() {
+                    None
+                } else {
+                    Some(repo.editor.clone())
+                },
+                additional_panels: repo.additional_panels,
             })
         })
         .collect()
@@ -275,6 +291,7 @@ fn plan_for_repo(
 }
 
 fn execute(
+    cfg: &Config,
     request: &StartRequest,
     plan: &Plan,
     progress: &dyn RepoProgress,
@@ -287,7 +304,7 @@ fn execute(
             run_post_create_hooks(request, plan, progress)?;
         }
     }
-    let editor = launch_editor(request, &plan.repo, &plan.worktree, progress);
+    let editor = launch_editor(cfg, request, &plan.repo, &plan.worktree, progress);
     Ok(StartSuccess {
         repo: plan.repo_name.clone(),
         worktree_path: plan.worktree.clone(),
@@ -363,6 +380,7 @@ fn write_sidecar(plan: &Plan, request: &StartRequest) -> Result<()> {
 }
 
 fn launch_editor(
+    cfg: &Config,
     request: &StartRequest,
     repo: &RepoConfig,
     worktree: &Path,
@@ -370,6 +388,11 @@ fn launch_editor(
 ) -> EditorStatus {
     if !request.spawn_editor || repo.editor.is_empty() {
         return EditorStatus::Skipped;
+    }
+    if !cfg.detached_editor {
+        // Attached (default): the pane is built later, once every repo has
+        // finished starting, by `finalize_cmux`.
+        return EditorStatus::Attached;
     }
     progress.step("launching editor");
     match editor::spawn(&repo.editor, worktree) {
@@ -406,6 +429,8 @@ mod tests {
                 tasks_dir,
                 username: None,
                 default_repos: vec![],
+                agent: None,
+                detached_editor: true,
                 cmux: None,
                 repos: BTreeMap::new(),
             };
@@ -450,9 +475,7 @@ mod tests {
         }
 
         fn worktree_path(&self, repo: &str, user: &str, task: &str) -> PathBuf {
-            self.cfg
-                .repo_tasks_dir(repo)
-                .join(paths::worktree_dirname(user, task))
+            self.cfg.task_root(user, task).join(repo)
         }
     }
 
@@ -713,6 +736,32 @@ mod tests {
     }
 
     #[test]
+    fn editor_attached_by_default_instead_of_spawned() {
+        let mut s = Scaffold::new();
+        s.add_repo("frontend", "true {path}");
+        s.cfg.detached_editor = false;
+
+        let mut request = req("PROJ-1", &["frontend"]);
+        request.spawn_editor = true;
+
+        let report = start(&s.cfg, request, &NullReporter).unwrap();
+        assert_eq!(report.successes[0].editor, EditorStatus::Attached);
+    }
+
+    #[test]
+    fn editor_spawned_when_detached_editor_enabled() {
+        let mut s = Scaffold::new();
+        s.add_repo("frontend", "true {path}");
+        s.cfg.detached_editor = true;
+
+        let mut request = req("PROJ-1", &["frontend"]);
+        request.spawn_editor = true;
+
+        let report = start(&s.cfg, request, &NullReporter).unwrap();
+        assert_eq!(report.successes[0].editor, EditorStatus::Spawned);
+    }
+
+    #[test]
     fn reporter_receives_create_event_sequence() {
         use crate::progress::testing::{Event, RecordingReporter};
 
@@ -859,74 +908,52 @@ mod tests {
     }
 
     #[test]
-    fn cmux_contributors_includes_only_repos_with_panes() {
-        use crate::cmux::config::{PaneSpec, RepoCmuxConfig};
-
+    fn cmux_contributors_includes_every_successful_repo() {
         let mut s = Scaffold::new();
-        s.add_repo("frontend", "");
+        s.add_repo("frontend", "zed {path}");
         s.add_repo("backend", "");
-        // FE has a layout, BE does not.
-        s.cfg.repos.get_mut("frontend").unwrap().cmux = Some(RepoCmuxConfig {
-            panes: vec![PaneSpec {
-                cmd: Some("pnpm dev".into()),
-                split: None,
-                size: None,
-                tabs: Vec::new(),
-            }],
-        });
-        // BE has an empty cmux block — also should not participate.
-        s.cfg.repos.get_mut("backend").unwrap().cmux = Some(RepoCmuxConfig { panes: Vec::new() });
 
         // Successes for both repos (the "happy path" mid-pipeline).
         let successes = vec![
             StartSuccess {
                 repo: "frontend".into(),
-                worktree_path: PathBuf::from("/csw/tasks/frontend/alice-PROJ-1"),
+                worktree_path: PathBuf::from("/csw/tasks/alice-PROJ-1/frontend"),
                 branch: "alice/PROJ-1".into(),
                 action: StartAction::Created,
-                editor: EditorStatus::Skipped,
+                editor: EditorStatus::Attached,
             },
             StartSuccess {
                 repo: "backend".into(),
-                worktree_path: PathBuf::from("/csw/tasks/backend/alice-PROJ-1"),
+                worktree_path: PathBuf::from("/csw/tasks/alice-PROJ-1/backend"),
                 branch: "alice/PROJ-1".into(),
                 action: StartAction::Created,
-                editor: EditorStatus::Skipped,
+                editor: EditorStatus::Attached,
             },
         ];
 
         let contribs = cmux_contributors(&s.cfg, &successes);
-        assert_eq!(contribs.len(), 1);
-        assert_eq!(contribs[0].repo, "frontend");
+        assert_eq!(contribs.len(), 2);
+        let frontend = contribs.iter().find(|c| c.repo == "frontend").unwrap();
+        assert_eq!(frontend.editor_cmd.as_deref(), Some("zed {path}"));
+        let backend = contribs.iter().find(|c| c.repo == "backend").unwrap();
+        assert_eq!(backend.editor_cmd, None);
     }
 
     #[test]
     fn cmux_contributors_skips_failed_repos_implicitly() {
         // Failed repos never enter `successes`, so the helper only sees
         // succeeded ones.
-        use crate::cmux::config::{PaneSpec, RepoCmuxConfig};
-
         let mut s = Scaffold::new();
         s.add_repo("frontend", "");
         s.add_repo("backend", "");
-        for name in ["frontend", "backend"] {
-            s.cfg.repos.get_mut(name).unwrap().cmux = Some(RepoCmuxConfig {
-                panes: vec![PaneSpec {
-                    cmd: Some("ls".into()),
-                    split: None,
-                    size: None,
-                    tabs: Vec::new(),
-                }],
-            });
-        }
 
         // Only frontend in successes — backend "failed".
         let successes = vec![StartSuccess {
             repo: "frontend".into(),
-            worktree_path: PathBuf::from("/csw/tasks/frontend/alice-PROJ-1"),
+            worktree_path: PathBuf::from("/csw/tasks/alice-PROJ-1/frontend"),
             branch: "alice/PROJ-1".into(),
             action: StartAction::Created,
-            editor: EditorStatus::Skipped,
+            editor: EditorStatus::Attached,
         }];
 
         let contribs = cmux_contributors(&s.cfg, &successes);

@@ -1,13 +1,12 @@
-//! `csw list` — discover task worktrees by interrogating each canonical's
-//! `git worktree list`, filtering to entries that live under
-//! `<tasks_dir>/<repo_name>/`. The leaf directory name (`<user>-<task_id>`)
-//! tells us which task each worktree belongs to.
+//! `csw list` — discover task worktrees by walking `tasks_dir` directly.
+//! Each entry under `tasks_dir` is a task root named `<user>-<task_id>`;
+//! each repo subdirectory beneath it that's a registered git worktree is
+//! one of the task's repos.
 
 use crate::Config;
 use crate::{git, paths, sidecar};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -33,92 +32,75 @@ pub struct ListRequest {
 }
 
 pub fn list(cfg: &Config, request: &ListRequest) -> Result<Vec<TaskEntry>> {
-    let mut by_task: BTreeMap<String, TaskEntry> = BTreeMap::new();
+    let mut out = Vec::new();
 
-    for (repo_name, repo) in &cfg.repos {
-        if let Some(ref filter) = request.only_repo {
-            if filter != repo_name {
-                continue;
-            }
-        }
+    let read_dir = match std::fs::read_dir(&cfg.tasks_dir) {
+        Ok(d) => d,
+        // No tasks_dir yet — nothing has ever been started.
+        Err(_) => return Ok(out),
+    };
 
-        let canonical = cfg.canonical_path(repo);
-        if !git::is_git_repo(&canonical) {
+    for entry in read_dir {
+        let Ok(entry) = entry else { continue };
+        let task_dir = entry.path();
+        if !task_dir.is_dir() {
             continue;
         }
-
-        let tasks_root = cfg.repo_tasks_dir(repo_name);
-        let entries = match git::worktree_list(&canonical) {
-            Ok(es) => es,
-            // Don't take down the whole list when one repo's canonical is in
-            // a weird state — just skip it.
-            Err(_) => continue,
+        let Some(leaf) = task_dir.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(task_id) = paths::parse_worktree_dirname(leaf, &request.user) else {
+            continue;
         };
 
-        for entry in entries {
-            if !is_under(&entry.path, &tasks_root) {
+        let mut repos = Vec::new();
+        let mut title = None;
+        let mut created_at: Option<DateTime<Utc>> = None;
+
+        for repo_name in cfg.repos.keys() {
+            if let Some(ref filter) = request.only_repo {
+                if filter != repo_name {
+                    continue;
+                }
+            }
+            let worktree_path = task_dir.join(repo_name);
+            if !git::is_git_repo(&worktree_path) {
                 continue;
             }
-            let leaf = match entry.path.file_name().and_then(|s| s.to_str()) {
-                Some(n) => n,
-                None => continue,
-            };
-            let Some(task_id) = paths::parse_worktree_dirname(leaf, &request.user) else {
-                continue;
-            };
 
-            let sidecar_data = sidecar::read(&entry.path).ok().flatten();
-            let title = sidecar_data.as_ref().and_then(|s| s.title.clone());
-            let created_at = sidecar_data.as_ref().map(|s| s.created_at);
-
-            let bucket = by_task.entry(task_id.clone()).or_insert_with(|| TaskEntry {
-                task_id: task_id.clone(),
-                repos: Vec::new(),
-                title: None,
-                created_at: None,
-            });
-            bucket.repos.push(RepoEntry {
-                repo: repo_name.clone(),
-                worktree_path: entry.path.clone(),
-            });
-            if bucket.title.is_none() {
-                bucket.title = title;
+            let sidecar_data = sidecar::read(&worktree_path).ok().flatten();
+            if title.is_none() {
+                title = sidecar_data.as_ref().and_then(|s| s.title.clone());
             }
-            bucket.created_at = match (bucket.created_at, created_at) {
+            let this_created_at = sidecar_data.as_ref().map(|s| s.created_at);
+            created_at = match (created_at, this_created_at) {
                 (Some(a), Some(b)) if a < b => Some(a),
                 (Some(a), None) => Some(a),
                 (_, Some(b)) => Some(b),
                 _ => None,
             };
+
+            repos.push(RepoEntry {
+                repo: repo_name.clone(),
+                worktree_path,
+            });
         }
+
+        if repos.is_empty() {
+            continue;
+        }
+
+        out.push(TaskEntry {
+            task_id,
+            repos,
+            title,
+            created_at,
+        });
     }
 
-    let mut out: Vec<TaskEntry> = by_task.into_values().collect();
     // Most recent first; tasks without timestamps end up at the end.
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(out)
-}
-
-/// Whether `path` lives directly under `parent` (single nesting level).
-/// Compares canonicalised forms first to absorb macOS-style `/var` →
-/// `/private/var` differences between `git worktree list` output and the
-/// raw `tasks_dir` from the config.
-fn is_under(path: &std::path::Path, parent: &std::path::Path) -> bool {
-    let direct = path.parent().map(|p| p == parent).unwrap_or(false);
-    if direct {
-        return true;
-    }
-    let path_parent = match path.parent() {
-        Some(p) => p,
-        None => return false,
-    };
-    match (
-        std::fs::canonicalize(path_parent),
-        std::fs::canonicalize(parent),
-    ) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -151,6 +133,8 @@ mod tests {
                     tasks_dir,
                     username: None,
                     default_repos: vec![],
+                    agent: None,
+                    detached_editor: true,
                     cmux: None,
                     repos: BTreeMap::new(),
                 },
@@ -299,8 +283,10 @@ mod tests {
         let mut s = Scaffold::new();
         s.add_repo("frontend");
         s.start_task("PROJ-1", &["frontend"], None);
-        // Drop noise inside the repo's tasks dir.
-        std::fs::create_dir_all(s.cfg.repo_tasks_dir("frontend").join("bob-IGNORE")).unwrap();
+        // Drop noise directly inside tasks_dir: another user's task, and a
+        // plain non-worktree directory.
+        std::fs::create_dir_all(s.cfg.tasks_dir.join("bob-IGNORE")).unwrap();
+        std::fs::create_dir_all(s.cfg.tasks_dir.join("not-a-task-dir")).unwrap();
 
         let r = list(&s.cfg, &req()).unwrap();
         assert_eq!(
@@ -310,5 +296,17 @@ mod tests {
             r.iter().map(|t| &t.task_id).collect::<Vec<_>>()
         );
         assert_eq!(r[0].task_id, "PROJ-1");
+    }
+
+    #[test]
+    fn list_skips_task_dir_with_no_registered_repos() {
+        let mut s = Scaffold::new();
+        s.add_repo("frontend");
+        // A task-shaped directory that isn't actually a git worktree for
+        // any configured repo (e.g. leftover cruft).
+        std::fs::create_dir_all(s.cfg.tasks_dir.join("alice-EMPTY").join("frontend")).unwrap();
+
+        let r = list(&s.cfg, &req()).unwrap();
+        assert!(r.is_empty(), "task ids: {:?}", r);
     }
 }

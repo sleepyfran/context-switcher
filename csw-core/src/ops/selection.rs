@@ -57,6 +57,8 @@ mod tests {
             tasks_dir: PathBuf::from("/x/tasks"),
             username: None,
             default_repos: default_repos.iter().map(|s| (*s).into()).collect(),
+            agent: None,
+            detached_editor: true,
             cmux: None,
             repos,
         }

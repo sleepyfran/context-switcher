@@ -1,14 +1,14 @@
 # csw
 
-A Rust CLI I built for myself. It wraps `git worktree` for tasks that span one or more repos, with hooks for the rest of my workflow: CMux workspace orchestration and whatever else I might add later.
+A Rust CLI I built for myself. It wraps `git worktree` for tasks that span one or more repos, with hooks for the rest of my workflow: CMux workspace orchestration, an agent that gets dropped into the task root, and whatever else I might add later.
 
 ## Why it exists
 
-Since I started using agentic coding more and more I find myself doing a lot of switching in between different contexts. These contexts usually includes different repos checked-out on different tasks and since, _gasp_, I still want to be in control of the code I output I end up always switching branches, retesting here and there... It was just too messy to keep track of by hand, so that's where `csw` enters the picture. One command spins up worktrees for as many repos as the task touches, copies what needs copying, runs whatever needs running, opens the editor, builds the CMux workspace. One command tears it all down. Worktrees are just plumbing; what I actually keep adding to is the integration layer (post-create hooks, CMux layout, future editor wiring).
+Since I started using agentic coding more and more I find myself doing a lot of switching in between different contexts. These contexts usually includes different repos checked-out on different tasks and since, _gasp_, I still want to be in control of the code I output I end up always switching branches, retesting here and there... It was just too messy to keep track of by hand, so that's where `csw` enters the picture. One command spins up worktrees for as many repos as the task touches, copies what needs copying, runs whatever needs running, opens the editors, drops an agent into the task root with visibility of every repo, builds the CMux workspace. One command tears it all down. Worktrees are just plumbing; what I actually keep adding to is the integration layer (post-create hooks, CMux layout, the agent pane).
 
 ## How it works
 
-Each task lives at `<tasks_dir>/<repo>/<user>-<task-id>` as a real `git worktree` linked to the canonical clone. Default `tasks_dir` is `~/.config/context-switcher/tasks/`.
+Each task lives at `<tasks_dir>/<user>-<task-id>/<repo>` as a real `git worktree` linked to the canonical clone — every repo a task touches lives together under one task root. Default `tasks_dir` is `~/.config/context-switcher/tasks/`.
 
 ```
 ~/Developer/
@@ -18,12 +18,14 @@ Each task lives at `<tasks_dir>/<repo>/<user>-<task-id>` as a real `git worktree
 ~/.config/context-switcher/
 ├── config.toml
 └── tasks/
-    ├── frontend/
-    │   ├── alice-PROJ-123/             # worktree, branch alice/PROJ-123
-    │   └── alice-PROJ-456/             # another task
-    └── backend/
-        └── alice-PROJ-123/             # same task, different repo
+    ├── alice-PROJ-123/                 # task root
+    │   ├── frontend/                   # worktree, branch alice/PROJ-123
+    │   └── backend/                    # same task, different repo
+    └── alice-PROJ-456/                 # another task
+        └── frontend/
 ```
+
+Task-rooted layout means the agent (and you) can `cd` once and see every repo the task touches, and cross-repo operations (moving a task, inspecting it as a whole) don't need to reach into N separate per-repo directories.
 
 ## Install
 
@@ -73,7 +75,13 @@ That puts a `csw` binary at `~/.cargo/bin` (which you'll want on `$PATH`). You a
    csw config repo default frontend
    ```
 
-6. Sanity check what got written:
+6. Optionally set the agent command that gets dropped into the task root on `csw start` (see [CMux integration](#cmux-integration)):
+
+   ```sh
+   csw config set agent claude
+   ```
+
+7. Sanity check what got written:
 
    ```sh
    csw config show
@@ -159,9 +167,27 @@ csw done PROJ-123 --keep-workspace  # don't close the matching CMux workspace
 
 If the branch is pushed but not merged into your base branch, csw warns and prompts before removing. Pass `--yes` to skip the prompt.
 
+## Migrating from the old layout
+
+Older versions of csw laid worktrees out per-repo (`<tasks_dir>/<repo>/<user>-<task-id>`) instead of per-task. If csw finds tasks still sitting in that shape, every command that discovers tasks (`start`, `list`, `status`, `done`, `nav`, `retitle`) prints a one-line warning:
+
+```
+warning: 2 legacy tasks found under the old layout — run `csw migrate`
+```
+
+Run the migration:
+
+```sh
+csw migrate --dry-run   # show what would move, without touching anything
+csw migrate             # prompts for confirmation, then moves everything
+csw migrate --yes       # skip the confirmation prompt
+```
+
+It uses `git worktree move` under the hood (not a raw `mv`), so branches, git metadata, and sidecars all survive the move intact, and it cleans up the now-empty old per-repo directories once nothing's left in them. Migration is user-agnostic — it picks up every old-format task it finds on disk, regardless of which user owns it.
+
 ## Per-repo configuration
 
-Each repo can override the base branch (defaults to `origin/HEAD`) and use its own editor:
+Each repo can override the base branch (defaults to `origin/HEAD`), use its own editor, and open extra idle tabs alongside it:
 
 ```sh
 csw config repo add api \
@@ -175,7 +201,10 @@ Update one field later:
 ```sh
 csw config repo set api editor "code {path}"
 csw config repo set api base_branch main
+csw config repo set api additional_panels 2
 ```
+
+`additional_panels` opens that many extra idle tabs (CMux surfaces) behind the repo's editor pane in the top row — each just `cd`'d into the repo's worktree, nothing autostarting. Switch between them with ⌘[ / ⌘]. Only takes effect when editors are attached (see [CMux integration](#cmux-integration)); it's ignored with `detached_editor = true` since there's no editor pane to attach tabs to.
 
 Remove a repo:
 
@@ -269,61 +298,42 @@ That opens the config in `$VISUAL` / `$EDITOR` / `vi`, validates that the result
 
 ## CMux integration
 
-If you use [CMux](https://cmux.com) as your terminal multiplexer, csw can spin up a workspace each time you `csw start`: one sidebar entry per task, with panes for the repos it spans and a deterministic accent color. `csw done` closes that workspace alongside the disk cleanup.
+If you use [CMux](https://cmux.com) as your terminal multiplexer, csw can spin up a workspace each time you `csw start`: one sidebar entry per task, laid out as a top row of editor panes plus a bottom agent pane, with a deterministic accent color. `csw done` closes that workspace alongside the disk cleanup.
 
 The integration activates only when csw notices it's running inside a CMux surface (the `CMUX_WORKSPACE_ID` env var that CMux auto-exports). Outside CMux it's a complete no-op; nothing about your config or workflow changes for non-CMux callers.
 
-### Per-repo layout
+### The fixed layout
 
-A repo participates by adding a `[repos.<name>.cmux]` block with one or more panes:
+The layout isn't per-pane configurable anymore — it's the same shape every time:
 
-```toml
-[repos.frontend.cmux]
-panes = [
-  { cmd = "pnpm dev" },                       # autostarts in the worktree
-  { cmd = "claude", split = "right" },        # split to the right of the previous pane
-]
-
-[repos.backend.cmux]
-panes = [
-  {},                                          # idle shell, cd'd into the worktree
-]
-```
-
-Each pane runs its `cmd` in a shell rooted at the worktree. Omit `cmd` to get just the shell prompt with no autostart, useful for repos where you don't want the dev server firing every time you open the task.
-
-The first pane in a repo has no `split`; it inherits the repo's slot in the workspace. Subsequent panes specify a `split` direction (`"left"`, `"right"`, `"up"`, `"down"`) relative to the previous pane.
-
-Optional `tabs` stacks extra surfaces behind a pane (CMux's ⌘[ / ⌘] navigates them):
+- **Top row**: one pane per repo the task was started with, laid out left-to-right, each running that repo's `editor` command, `cd`'d into that repo's worktree.
+- **Bottom pane**: a single pane spanning the full width, running the top-level `agent` command, `cd`'d into the *task root* — so the agent has visibility of every repo the task touches, not just one.
 
 ```toml
-[repos.frontend.cmux]
-panes = [
-  { cmd = "pnpm dev", tabs = [{ cmd = "sh" }, {}] },
-  { cmd = "claude", split = "right" },
-]
+agent = "claude"
+
+[repos.frontend]
+path = "frontend"
+editor = "nvim"
+
+[repos.backend]
+path = "backend"
+editor = "nvim"
 ```
 
-Repos with no `[repos.<name>.cmux]` block contribute no pane to the workspace. They still get their worktree on disk and editor spawn as usual.
+`csw start PROJ-123 --repos frontend,backend` then opens a workspace with `frontend` and `backend` panes side by side on top, and `claude` running in the task root underneath. Leave `editor` empty on a repo to get just an idle shell in its slot; leave `agent` unset to skip the bottom pane entirely (top row only). If neither is set, csw skips workspace creation — no empty sidebar entries.
 
-### Pane sizing
+Use `csw config repo set <name> additional_panels <N>` to open extra idle tabs behind a repo's editor pane (see [Per-repo configuration](#per-repo-configuration)).
 
-By default CMux opens every split 50/50. Add a `size` to a pane to bias the split. The value is the fraction of the axis the new pane should take, between 0 and 1, and it only applies when `split` is set (the first pane in a repo inherits the repo's slot, so there is nothing to size).
+### Attached vs. detached editors
+
+By default (`detached_editor = false`) editors run **attached**, as the top-row CMux panes described above. Set `detached_editor = true` to go back to the old behavior instead: each repo's `editor` launches as a detached GUI process (`zed .`, `code .`, ...) in its own window, independent of CMux, and no top row is built — the workspace then contains just the full-width agent pane (or nothing, if no `agent` is set).
 
 ```toml
-[repos.frontend.cmux]
-panes = [
-  { cmd = "pnpm dev" },
-  { cmd = "claude", split = "right", size = 0.3 },  # claude gets ~30% of the width
-]
+detached_editor = true   # default false (attached / CMux panes)
 ```
 
-A few things to know:
-
-- The ratio is approximate. CMux's `pane.resize` socket method only accepts a pixel delta, not an absolute ratio, so csw computes the call from a typical viewport size and then sends one corrective resize using the real axis size derived from the first response. The achieved ratio lands within a fraction of a percent of the target on a typical display.
-- CMux internally clamps the divider to [0.1, 0.9]. Values outside that range get pulled back into it.
-- Requires a CMux build that exposes `pane.resize` (the tmux-compat method set, available in builds from early 2026 onward). On older builds the resize call is a no-op and the split stays at 50/50. The rest of the layout still applies normally.
-- Inter-repo slot sizing (the splits between repos in a multi-repo task) is not configurable yet. Those slots stay evenly divided.
+Attached is the right default for terminal editors (`nvim`, `hx`) — they need a pane to run in. Flip to `detached_editor = true` if your editor is a GUI app that spawns its own window (`zed`, `code`, `pycharm`); it doesn't need a CMux pane at all.
 
 ### Workspace name and color
 
@@ -346,8 +356,6 @@ csw start PROJ-123 --no-cmux              # this invocation only
 csw start PROJ-123 --force-new-workspace  # skip in-place adoption for this invocation
 csw done  PROJ-123 --keep-workspace       # leave the workspace open after done
 ```
-
-A repo without a `[repos.<name>.cmux]` block also doesn't participate. If no selected repo has a layout, csw skips workspace creation entirely; no empty sidebar entries.
 
 ### Resume and idempotency
 
@@ -377,14 +385,14 @@ If the current workspace has multiple panes, multiple tabs, or csw can't query t
 
 ### Editor relationship
 
-The CMux integration is purely a terminal-side workbench. The per-repo `editor` template still fires as today: a GUI editor (Zed, VS Code, ...) opens in its own window, while the CMux workspace handles the terminal panes (build, Claude, scratch shells). Use `csw start --no-editor` if you don't want the GUI editor; use `--no-cmux` if you don't want the workspace; set both for a bare start.
+`editor` (per-repo, in `[repos.<name>]`) drives both worlds: attached (default), it becomes a top-row CMux pane's command; detached, it's spawned as a GUI process the old way, via `editor::spawn`. `--no-editor` skips launching/attaching editors for that invocation either way; `--no-cmux` skips the whole workspace (top row and agent pane both); set both for a bare start with nothing but worktrees on disk.
 
 ### Caveats
 
 - macOS only. CMux is macOS-only, and the integration code only fires when `CMUX_WORKSPACE_ID` is set in the env.
 - CMux failures are always soft. If the socket is unreachable or a method call fails, csw prints a single `warning: cmux: ...` line and continues. The exit code is never affected.
-- Changing a repo's `cmux` config has no effect on an already-open workspace. To pick up the new layout, close the workspace in CMux and `csw start` again, or just `csw done` and re-start.
-- Each pane's command is delivered via ` cd '<worktree>' && <cmd>\n` (leading space, single-quoted path). The cd line stays out of bash/zsh history when `HISTCONTROL` includes `ignorespace`; fish's history ignores leading-space lines by default.
+- Changing `agent`, `detached_editor`, a repo's `editor`, or its `additional_panels` has no effect on an already-open workspace. To pick up the new layout, close the workspace in CMux and `csw start` again, or just `csw done` and re-start.
+- Each pane's command is delivered via ` cd '<path>' && <cmd>\n` (leading space, single-quoted path). The cd line stays out of bash/zsh history when `HISTCONTROL` includes `ignorespace`; fish's history ignores leading-space lines by default.
 
 ## What lives where
 
@@ -398,10 +406,9 @@ After `csw start PROJ-123 --repos frontend,backend`:
 ~/.config/context-switcher/
 ├── config.toml
 └── tasks/
-    ├── frontend/
-    │   └── alice-PROJ-123/                 # worktree on alice/PROJ-123
-    └── backend/
-        └── alice-PROJ-123/                 # worktree on alice/PROJ-123
+    └── alice-PROJ-123/                     # task root
+        ├── frontend/                       # worktree on alice/PROJ-123
+        └── backend/                        # worktree on alice/PROJ-123
 ```
 
 The per-task sidecar (task id, branch, optional title, created-at) lives at `<canonical>/.git/worktrees/<wt-name>/csw.json`, inside the per-worktree git dir, which `git` wipes automatically when the worktree is removed. Nothing for csw to clean up on `done`.

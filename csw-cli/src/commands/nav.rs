@@ -12,6 +12,9 @@ use std::path::PathBuf;
 
 pub fn run(args: NavArgs) -> Result<i32> {
     let config = Config::load()?;
+    if let Some(warning) = ops::legacy_warning(&config) {
+        crate::output::warn(warning);
+    }
     let resolved_user = identity::resolve_username(&config)?;
 
     let task = resolve_task(&config, &resolved_user, args.task_id.as_deref())?;

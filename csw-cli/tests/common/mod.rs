@@ -129,7 +129,7 @@ impl Harness {
     }
 
     pub fn worktree_path(&self, repo: &str, user: &str, task: &str) -> PathBuf {
-        self.tasks_dir.join(repo).join(format!("{user}-{task}"))
+        self.tasks_dir.join(format!("{user}-{task}")).join(repo)
     }
 }
 

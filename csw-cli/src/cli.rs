@@ -58,6 +58,22 @@ pub enum Command {
     /// Manage the configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
+
+    /// Convert on-disk tasks from the old per-repo layout
+    /// (`<tasks_dir>/<repo>/<user>-<task_id>`) to the new task-rooted
+    /// layout (`<tasks_dir>/<user>-<task_id>/<repo>`).
+    Migrate(MigrateArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct MigrateArgs {
+    /// Show what would be migrated without moving anything.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip the confirmation prompt.
+    #[arg(long, short)]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug)]

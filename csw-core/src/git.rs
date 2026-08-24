@@ -238,6 +238,22 @@ pub fn worktree_prune(canonical: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Relocate a worktree on disk, keeping git's internal worktree
+/// administration consistent (unlike a raw `mv`). `new_path`'s parent must
+/// already exist.
+pub fn worktree_move(canonical: &Path, old_path: &Path, new_path: &Path) -> Result<()> {
+    run_checked(
+        Some(canonical),
+        &[
+            "worktree",
+            "move",
+            old_path.to_str().context("worktree path is not utf-8")?,
+            new_path.to_str().context("worktree path is not utf-8")?,
+        ],
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeEntry {
     pub path: PathBuf,

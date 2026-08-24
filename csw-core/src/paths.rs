@@ -1,9 +1,8 @@
 //! Filesystem layout: where task worktrees live on disk, and reverse parsing
 //! of a directory back into `(repo_name, task_id)`.
 //!
-//! A task worktree lives at `<tasks_dir>/<repo_name>/<user>-<task_id>`. The
-//! parent two segments tell us which repo and (implicitly) which user owns
-//! the worktree; the leaf encodes the task id.
+//! A task worktree lives at `<tasks_dir>/<user>-<task_id>/<repo_name>`. The
+//! middle segment encodes the user and task id; the leaf is the repo name.
 
 use crate::config::Config;
 use std::path::{Path, PathBuf};
@@ -12,9 +11,7 @@ const SEPARATOR: &str = "-";
 
 /// Compute the on-disk worktree path for a given task.
 pub fn worktree_path(config: &Config, repo_name: &str, user: &str, task_id: &str) -> PathBuf {
-    config
-        .repo_tasks_dir(repo_name)
-        .join(worktree_dirname(user, task_id))
+    config.task_root(user, task_id).join(repo_name)
 }
 
 /// Build a worktree directory name (the leaf) from its parts. Currently
@@ -40,8 +37,18 @@ pub fn parse_worktree_dirname(dirname: &str, user: &str) -> Option<String> {
     }
 }
 
-/// For a given absolute path, walk upward until we find a directory whose
-/// parent is one of the configured repos' tasks directories. Returns
+/// Recover the user from a worktree dirname (`<user>-<task_id>`) given the
+/// already-known `task_id`. The reverse of [`worktree_dirname`] — used by
+/// legacy-format detection, which discovers `task_id` from a sidecar or
+/// branch before it knows which user owns the directory.
+pub fn split_worktree_dirname_by_known_task(dirname: &str, task_id: &str) -> Option<String> {
+    let suffix = format!("{SEPARATOR}{task_id}");
+    let user = dirname.strip_suffix(&suffix)?;
+    if user.is_empty() { None } else { Some(user.to_string()) }
+}
+
+/// For a given absolute path, walk upward until we find a directory that is
+/// a repo subdirectory of a task root under `tasks_dir`. Returns
 /// `(repo_name, task_id, worktree_root)`.
 pub fn infer_task_from_path(
     config: &Config,
@@ -50,16 +57,15 @@ pub fn infer_task_from_path(
 ) -> Option<(String, String, PathBuf)> {
     let mut cursor: Option<&Path> = Some(start);
     while let Some(dir) = cursor {
-        let name = dir.file_name()?.to_string_lossy().into_owned();
-        let task_id = parse_worktree_dirname(&name, user);
-        if let Some(task_id) = task_id {
-            // The directory name parses; confirm its parent matches one of
-            // the configured repo tasks dirs.
-            if let Some(parent) = dir.parent() {
-                for repo_name in config.repos.keys() {
-                    let expected = config.repo_tasks_dir(repo_name);
-                    if same_directory(Some(parent), Some(&expected)) {
-                        return Some((repo_name.clone(), task_id, dir.to_path_buf()));
+        let repo_name = dir.file_name()?.to_string_lossy().into_owned();
+        if config.repos.contains_key(&repo_name) {
+            if let Some(task_dir) = dir.parent() {
+                if let Some(task_name) = task_dir.file_name() {
+                    let task_name = task_name.to_string_lossy();
+                    if let Some(task_id) = parse_worktree_dirname(&task_name, user) {
+                        if same_directory(task_dir.parent(), Some(&config.tasks_dir)) {
+                            return Some((repo_name, task_id, dir.to_path_buf()));
+                        }
                     }
                 }
             }
@@ -100,18 +106,44 @@ mod tests {
             tasks_dir: PathBuf::from(tasks_dir),
             username: None,
             default_repos: vec![],
+            agent: None,
+            detached_editor: false,
             cmux: None,
             repos,
         }
     }
 
     #[test]
-    fn worktree_path_joins_tasks_dir_repo_and_leaf() {
+    fn worktree_path_joins_tasks_dir_leaf_and_repo() {
         let cfg = cfg_with_repo("frontend", "frontend", "/csw/tasks");
         let p = worktree_path(&cfg, "frontend", "fran.gonzalez", "PROJ-123");
         assert_eq!(
             p,
-            PathBuf::from("/csw/tasks/frontend/fran.gonzalez-PROJ-123")
+            PathBuf::from("/csw/tasks/fran.gonzalez-PROJ-123/frontend")
+        );
+    }
+
+    #[test]
+    fn split_worktree_dirname_by_known_task_recovers_user() {
+        assert_eq!(
+            split_worktree_dirname_by_known_task("alice-PROJ-1", "PROJ-1"),
+            Some("alice".into())
+        );
+        assert_eq!(
+            split_worktree_dirname_by_known_task("fran.gonzalez-PROJ-123", "PROJ-123"),
+            Some("fran.gonzalez".into())
+        );
+    }
+
+    #[test]
+    fn split_worktree_dirname_by_known_task_rejects_mismatch() {
+        assert_eq!(
+            split_worktree_dirname_by_known_task("alice-PROJ-1", "PROJ-2"),
+            None
+        );
+        assert_eq!(
+            split_worktree_dirname_by_known_task("-PROJ-1", "PROJ-1"),
+            None
         );
     }
 
@@ -162,7 +194,7 @@ mod tests {
     #[test]
     fn infer_task_from_path_finds_worktree_directory() {
         let cfg = cfg_with_repo("frontend", "frontend", "/csw/tasks");
-        let dir = PathBuf::from("/csw/tasks/frontend/alice-PROJ-1");
+        let dir = PathBuf::from("/csw/tasks/alice-PROJ-1/frontend");
         let r = infer_task_from_path(&cfg, "alice", &dir).unwrap();
         assert_eq!(r.0, "frontend");
         assert_eq!(r.1, "PROJ-1");
@@ -172,7 +204,7 @@ mod tests {
     #[test]
     fn infer_task_walks_up_from_subdirectory() {
         let cfg = cfg_with_repo("frontend", "frontend", "/csw/tasks");
-        let inside = PathBuf::from("/csw/tasks/frontend/alice-PROJ-1/src/components");
+        let inside = PathBuf::from("/csw/tasks/alice-PROJ-1/frontend/src/components");
         let r = infer_task_from_path(&cfg, "alice", &inside).unwrap();
         assert_eq!(r.1, "PROJ-1");
     }
@@ -186,10 +218,17 @@ mod tests {
 
     #[test]
     fn infer_task_does_not_match_unrelated_parent() {
-        // Directory name parses but its parent isn't the configured repo's
-        // tasks dir — should not match.
+        // Directory name matches a configured repo but its grandparent
+        // isn't tasks_dir — should not match.
         let cfg = cfg_with_repo("frontend", "frontend", "/csw/tasks");
-        let elsewhere = PathBuf::from("/somewhere/else/alice-PROJ-1");
+        let elsewhere = PathBuf::from("/somewhere/else/alice-PROJ-1/frontend");
         assert!(infer_task_from_path(&cfg, "alice", &elsewhere).is_none());
+    }
+
+    #[test]
+    fn infer_task_does_not_match_unconfigured_repo_name() {
+        let cfg = cfg_with_repo("frontend", "frontend", "/csw/tasks");
+        let dir = PathBuf::from("/csw/tasks/alice-PROJ-1/backend");
+        assert!(infer_task_from_path(&cfg, "alice", &dir).is_none());
     }
 }
