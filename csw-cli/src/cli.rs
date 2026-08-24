@@ -96,6 +96,12 @@ pub struct StartArgs {
     #[arg(long)]
     pub title: Option<String>,
 
+    /// When resuming a task inferred from the current directory, operate on
+    /// every repo the task lives in instead of just the repo owning the
+    /// current folder.
+    #[arg(long)]
+    pub all: bool,
+
     /// Skip launching the editor.
     #[arg(long)]
     pub no_editor: bool,

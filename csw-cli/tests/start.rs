@@ -418,6 +418,69 @@ fn start_without_arg_infers_task_from_current_directory() {
 }
 
 #[test]
+fn start_without_arg_scopes_resume_to_owning_repo() {
+    let h = Harness::new();
+    h.config_set_base_dir();
+    h.config_set_username("alice");
+    h.add_repo("frontend", "");
+    h.add_repo("backend", "");
+
+    h.cmd()
+        .args([
+            "start",
+            "PROJ-1",
+            "--repos",
+            "frontend,backend",
+            "--no-editor",
+        ])
+        .assert()
+        .success();
+
+    // Bare `csw start` from inside the frontend worktree should resume only
+    // the frontend copy, not every repo the task lives in.
+    let fe = h.worktree_path("frontend", "alice", "PROJ-1");
+    h.cmd()
+        .current_dir(&fe)
+        .args(["start", "--no-editor"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("PROJ-1 [frontend]"))
+        .stderr(predicate::str::contains("resumed [frontend]"))
+        .stderr(predicate::str::contains("[backend]").not());
+}
+
+#[test]
+fn start_without_arg_all_flag_resumes_every_repo() {
+    let h = Harness::new();
+    h.config_set_base_dir();
+    h.config_set_username("alice");
+    h.add_repo("frontend", "");
+    h.add_repo("backend", "");
+
+    h.cmd()
+        .args([
+            "start",
+            "PROJ-1",
+            "--repos",
+            "frontend,backend",
+            "--no-editor",
+        ])
+        .assert()
+        .success();
+
+    // `csw start --all` from inside the frontend worktree keeps the previous
+    // behaviour: every repo of the task is resumed.
+    let fe = h.worktree_path("frontend", "alice", "PROJ-1");
+    h.cmd()
+        .current_dir(&fe)
+        .args(["start", "--all", "--no-editor"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[frontend]"))
+        .stderr(predicate::str::contains("[backend]"));
+}
+
+#[test]
 fn start_accepts_no_cmux_flag() {
     let h = Harness::new();
     h.config_set_base_dir();

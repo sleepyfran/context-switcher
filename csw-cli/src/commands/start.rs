@@ -20,7 +20,7 @@ pub fn run(args: StartArgs) -> Result<i32> {
     let (raw_task, repos_override) = match args.task_id {
         Some(t) => (t, None),
         None => {
-            let entry = resolve_task_without_arg(&config, &resolved_user)?;
+            let entry = resolve_task_without_arg(&config, &resolved_user, args.all)?;
             let repos: Vec<String> = entry.repos.iter().map(|r| r.repo.clone()).collect();
             (entry.task_id, Some(repos))
         }
@@ -95,23 +95,27 @@ fn parse_branch_overrides(input: &[String]) -> Result<BTreeMap<String, String>> 
 /// argument. First tries to infer the task from the current directory (so
 /// running `csw start` from inside a task worktree resumes it), then falls
 /// back to listing every task on disk and picking one.
-fn resolve_task_without_arg(config: &Config, user: &str) -> Result<TaskEntry> {
-    if let Some(entry) = task_from_cwd(config, user)? {
+fn resolve_task_without_arg(config: &Config, user: &str, all_repos: bool) -> Result<TaskEntry> {
+    if let Some(entry) = task_from_cwd(config, user, all_repos)? {
+        let scope: Vec<&str> = entry.repos.iter().map(|r| r.repo.as_str()).collect();
         output::step(format!(
-            "resuming task from current directory: {}",
-            entry.task_id
+            "resuming task from current directory: {} [{}]",
+            entry.task_id,
+            scope.join(", ")
         ));
         return Ok(entry);
     }
     pick_existing_task(config, user)
 }
 
-/// Infer the task owning the current working directory, if any. Returns the
-/// full `TaskEntry` (spanning every repo the task lives in) so behaviour
-/// matches selecting that task from the picker.
-fn task_from_cwd(config: &Config, user: &str) -> Result<Option<TaskEntry>> {
+/// Infer the task owning the current working directory, if any. By default
+/// the entry is scoped to the repo owning the current folder, so only that
+/// repo's copy is resumed (and only its editor opens). With `all_repos` the
+/// full `TaskEntry` (spanning every repo the task lives in) is returned,
+/// matching what selecting the task from the picker would do.
+fn task_from_cwd(config: &Config, user: &str, all_repos: bool) -> Result<Option<TaskEntry>> {
     let cwd = std::env::current_dir()?;
-    let Some((_repo, task_id, _root)) = paths::infer_task_from_path(config, user, &cwd) else {
+    let Some((repo, task_id, _root)) = paths::infer_task_from_path(config, user, &cwd) else {
         return Ok(None);
     };
     let entries = ops::list::list(
@@ -121,7 +125,13 @@ fn task_from_cwd(config: &Config, user: &str) -> Result<Option<TaskEntry>> {
             only_repo: None,
         },
     )?;
-    Ok(entries.into_iter().find(|t| t.task_id == task_id))
+    let mut entry = entries.into_iter().find(|t| t.task_id == task_id);
+    if !all_repos {
+        if let Some(e) = entry.as_mut() {
+            e.repos.retain(|r| r.repo == repo);
+        }
+    }
+    Ok(entry)
 }
 
 /// Used when `csw start` is invoked without a task argument. Lists every
