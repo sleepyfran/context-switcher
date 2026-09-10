@@ -154,6 +154,12 @@ pub struct NavArgs {
     #[arg(long)]
     pub repo: Option<String>,
 
+    /// Land on the task folder itself (`<tasks_dir>/<user>-<task_id>`) instead
+    /// of one of its repo copies. Handy for multi-repo tasks, where the task
+    /// root is the only place all the copies are visible at once.
+    #[arg(long, conflicts_with = "repo")]
+    pub root: bool,
+
     /// Print the absolute path of the chosen copy to stdout instead of
     /// spawning a subshell. Useful for shell wrappers like
     /// `cs() { cd "$(csw nav --print-path "$@")"; }`.

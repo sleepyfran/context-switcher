@@ -8,7 +8,7 @@ use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
 use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn run(args: NavArgs) -> Result<i32> {
     let config = Config::load()?;
@@ -18,6 +18,16 @@ pub fn run(args: NavArgs) -> Result<i32> {
     let resolved_user = identity::resolve_username(&config)?;
 
     let task = resolve_task(&config, &resolved_user, args.task_id.as_deref())?;
+
+    if args.root {
+        let root = task_root(&task)?;
+        if args.print_path {
+            println!("{}", root.display());
+            return Ok(0);
+        }
+        return enter_task_root(&resolved_user, &task, &root);
+    }
+
     let chosen = pick_repo(&task, args.repo.as_deref())?;
 
     if args.print_path {
@@ -26,6 +36,17 @@ pub fn run(args: NavArgs) -> Result<i32> {
     }
 
     enter_subshell(&config, &resolved_user, &task, &chosen)
+}
+
+/// The folder holding every repo copy of a task: the parent of any of its
+/// worktrees. Derived from disk rather than recomputed from config so it
+/// keeps matching whatever `list` actually found.
+fn task_root(task: &TaskEntry) -> Result<PathBuf> {
+    task.repos
+        .first()
+        .and_then(|r| r.worktree_path.parent())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("task {} has no worktrees on disk", task.task_id))
 }
 
 fn resolve_task(config: &Config, user: &str, task_arg: Option<&str>) -> Result<TaskEntry> {
@@ -145,6 +166,7 @@ fn enter_subshell(
     ));
 
     let env = env_for_subshell(EnvCtx {
+        task_root: task_root(task)?,
         worktree: chosen.worktree_path.clone(),
         canonical,
         task_id: task.task_id.clone(),
@@ -156,7 +178,27 @@ fn enter_subshell(
     shell::spawn_subshell(&chosen.worktree_path, &env)
 }
 
+fn enter_task_root(user: &str, task: &TaskEntry, root: &Path) -> Result<i32> {
+    let repos: Vec<&str> = task.repos.iter().map(|r| r.repo.as_str()).collect();
+
+    output::step(format!(
+        "entered task {}/{} root [{}] — exit to leave",
+        user,
+        task.task_id,
+        repos.join(", ")
+    ));
+
+    let mut env = HashMap::new();
+    env.insert("CSW_TASK_ROOT".into(), root.display().to_string());
+    env.insert("CSW_TASK_ID".into(), task.task_id.clone());
+    env.insert("CSW_USER".into(), user.to_string());
+    env.insert("CSW_REPOS".into(), repos.join(","));
+
+    shell::spawn_subshell(root, &env)
+}
+
 struct EnvCtx {
+    task_root: PathBuf,
     worktree: PathBuf,
     canonical: PathBuf,
     task_id: String,
@@ -167,6 +209,7 @@ struct EnvCtx {
 
 fn env_for_subshell(ctx: EnvCtx) -> HashMap<String, String> {
     let mut env = HashMap::new();
+    env.insert("CSW_TASK_ROOT".into(), ctx.task_root.display().to_string());
     env.insert("CSW_WORKTREE".into(), ctx.worktree.display().to_string());
     env.insert("CSW_CANONICAL".into(), ctx.canonical.display().to_string());
     env.insert("CSW_TASK_ID".into(), ctx.task_id);

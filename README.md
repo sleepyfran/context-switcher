@@ -124,10 +124,13 @@ Drop into a subshell rooted at one of a task's worktrees:
 csw nav PROJ-123                   # one-repo task: just enter
 csw nav PROJ-123 --repo backend    # multi-repo task: pick which one
 csw nav                            # no arg: pick a task interactively
+csw nav PROJ-123 --root            # land on the task folder, not a repo copy
 csw nav PROJ-123 --print-path      # emit the path instead of spawning a shell
 ```
 
-The subshell inherits your env, gets `CSW_TASK_ID`, `CSW_BRANCH`, `CSW_REPO`, `CSW_USER`, `CSW_WORKTREE`, and `CSW_CANONICAL` exported (handy for prompt customisation), and propagates its exit code. Type `exit` or hit Ctrl+D to come back to where you were.
+The subshell inherits your env, gets `CSW_TASK_ID`, `CSW_BRANCH`, `CSW_REPO`, `CSW_USER`, `CSW_WORKTREE`, `CSW_TASK_ROOT`, and `CSW_CANONICAL` exported (handy for prompt customisation), and propagates its exit code. Type `exit` or hit Ctrl+D to come back to where you were.
+
+`--root` drops you at `<tasks_dir>/<user>-<task-id>` — the folder that holds every repo copy of the task — instead of picking one of them. It never prompts for a repo (and can't be combined with `--repo`), so it's the quickest way into a multi-repo task; the subshell gets `CSW_TASK_ID`, `CSW_USER`, `CSW_TASK_ROOT`, and `CSW_REPOS` (comma-separated) instead of the per-repo vars. Combines with `--print-path`.
 
 `--print-path` is the escape hatch for shell wrappers, e.g. a fish function `function cs; cd (csw nav --print-path $argv); end` to swap the subshell for a real `cd` in your current shell.
 
