@@ -226,6 +226,7 @@ fn preflight(cfg: &Config, request: &StartRequest) -> Result<Vec<Plan>> {
             .branch_overrides
             .get(name)
             .cloned()
+            .or_else(|| recorded_branch(cfg, name, &request.user, &request.task_id))
             .unwrap_or_else(|| default_branch.clone());
         match plan_for_repo(
             cfg,
@@ -243,6 +244,21 @@ fn preflight(cfg: &Config, request: &StartRequest) -> Result<Vec<Plan>> {
         return Err(anyhow!("pre-flight failed:\n  - {}", errors.join("\n  - ")));
     }
     Ok(plans)
+}
+
+/// Branch recorded in an existing worktree's sidecar, if any. Lets a resume
+/// without `--branch` pick up the override the task was created with instead
+/// of falling back to the default `<user>/<task_id>` branch.
+fn recorded_branch(cfg: &Config, repo_name: &str, user: &str, task_id: &str) -> Option<String> {
+    let worktree = paths::worktree_path(cfg, repo_name, user, task_id);
+    if !worktree.exists() {
+        return None;
+    }
+    sidecar::read(&worktree)
+        .ok()
+        .flatten()
+        .map(|sc| sc.branch)
+        .filter(|b| !b.trim().is_empty())
 }
 
 fn plan_for_repo(
@@ -889,11 +905,9 @@ mod tests {
     }
 
     #[test]
-    fn resume_without_override_after_create_with_override_fails() {
-        // Created previously with override, now resuming without it: the
-        // computed default branch won't match the on-disk branch and we'd
-        // rather error than silently operate on a different branch than
-        // the user implied.
+    fn resume_without_override_uses_branch_recorded_at_create() {
+        // Created with an override, resumed without it: the sidecar's branch
+        // wins over the computed default.
         let mut s = Scaffold::new();
         s.add_repo("frontend", "");
         let mut create = req("PROJ-1", &["frontend"]);
@@ -903,8 +917,27 @@ mod tests {
         start(&s.cfg, create, &NullReporter).unwrap();
 
         let resume = req("PROJ-1", &["frontend"]);
+        let report = start(&s.cfg, resume, &NullReporter).unwrap();
+        assert_eq!(report.successes[0].action, StartAction::Resumed);
+        assert_eq!(report.successes[0].branch, "feature/legacy");
+    }
+
+    #[test]
+    fn resume_with_different_override_than_recorded_fails() {
+        let mut s = Scaffold::new();
+        s.add_repo("frontend", "");
+        let mut create = req("PROJ-1", &["frontend"]);
+        create
+            .branch_overrides
+            .insert("frontend".into(), "feature/legacy".into());
+        start(&s.cfg, create, &NullReporter).unwrap();
+
+        let mut resume = req("PROJ-1", &["frontend"]);
+        resume
+            .branch_overrides
+            .insert("frontend".into(), "feature/other".into());
         let err = start(&s.cfg, resume, &NullReporter).unwrap_err();
-        assert!(format!("{err}").contains("expected alice/PROJ-1"), "{err}");
+        assert!(format!("{err}").contains("expected feature/other"), "{err}");
     }
 
     #[test]
