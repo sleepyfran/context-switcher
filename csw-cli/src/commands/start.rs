@@ -1,9 +1,9 @@
 use crate::cli::StartArgs;
 use crate::{output, progress};
 use anyhow::{Result, bail};
-use csw_core::cmux::CmuxOutcome;
 use csw_core::config::Config;
 use csw_core::identity;
+use csw_core::mux::MuxOutcome;
 use csw_core::ops::{
     self, EditorStatus, ListRequest, StartAction, StartRequest, StartSuccess, TaskEntry,
 };
@@ -60,7 +60,7 @@ pub fn run(args: StartArgs) -> Result<i32> {
         title: args.title,
         spawn_editor: !args.no_editor,
         skip_hooks: args.skip_hooks,
-        no_cmux: args.no_cmux,
+        no_mux: args.no_mux,
         force_new_workspace: args.force_new_workspace,
         branch_overrides,
     };
@@ -189,28 +189,33 @@ fn render_report(report: &ops::StartReport) {
     for (repo, err) in &report.failures {
         output::error(format!("{repo}: {err:#}"));
     }
-    render_cmux(&report.cmux);
+    render_mux(&report.mux);
     for success in &report.successes {
         println!("{}", success.worktree_path.display());
     }
 }
 
-fn render_cmux(outcome: &CmuxOutcome) {
+fn render_mux(outcome: &MuxOutcome) {
     match outcome {
-        CmuxOutcome::NotApplicable | CmuxOutcome::NoContributors => {}
-        CmuxOutcome::Created { name } => output::step(format!("cmux: opened workspace {name}")),
-        CmuxOutcome::Adopted { name } => {
-            output::step(format!("cmux: reshaped current workspace into {name}"))
-        }
-        CmuxOutcome::Reused { name } => {
-            output::step(format!("cmux: focused existing workspace {name}"))
-        }
-        CmuxOutcome::Warned(msg) => output::warn(msg.clone()),
+        MuxOutcome::NotApplicable | MuxOutcome::NoContributors => {}
+        MuxOutcome::Created { provider, name } => output::step(format!(
+            "{provider}: opened {} {name}",
+            provider.workspace_noun()
+        )),
+        MuxOutcome::Adopted { provider, name } => output::step(format!(
+            "{provider}: reshaped current {} into {name}",
+            provider.workspace_noun()
+        )),
+        MuxOutcome::Reused { provider, name } => output::step(format!(
+            "{provider}: focused existing {} {name}",
+            provider.workspace_noun()
+        )),
+        MuxOutcome::Warned(msg) => output::warn(msg.clone()),
         // start should never produce a Closed/NotClosed/Renamed outcome.
-        CmuxOutcome::Closed { .. }
-        | CmuxOutcome::NotClosed
-        | CmuxOutcome::Renamed { .. }
-        | CmuxOutcome::NotRenamed => {}
+        MuxOutcome::Closed { .. }
+        | MuxOutcome::NotClosed
+        | MuxOutcome::Renamed { .. }
+        | MuxOutcome::NotRenamed => {}
     }
 }
 
@@ -228,7 +233,7 @@ fn render_success(s: &StartSuccess) {
     ));
     match &s.editor {
         EditorStatus::Spawned => output::debug(format!("editor spawned for {}", s.repo)),
-        EditorStatus::Attached => output::debug(format!("editor attached (cmux) for {}", s.repo)),
+        EditorStatus::Attached => output::debug(format!("editor attached (mux) for {}", s.repo)),
         EditorStatus::Skipped => {}
         EditorStatus::Failed(e) => output::warn(format!("editor failed for {}: {e}", s.repo)),
     }

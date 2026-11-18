@@ -105,7 +105,7 @@ mod tests {
                     default_repos: vec![],
                     agent: None,
                     detached_editor: true,
-                    cmux: None,
+                    mux: None,
                     repos: BTreeMap::new(),
                 },
                 _tmp: tmp,
@@ -156,7 +156,7 @@ mod tests {
                 title: None,
                 spawn_editor: false,
                 skip_hooks: false,
-                no_cmux: true,
+                no_mux: true,
                 force_new_workspace: false,
                 branch_overrides: std::collections::BTreeMap::new(),
             };

@@ -499,3 +499,23 @@ fn start_accepts_no_cmux_flag() {
         .assert()
         .success();
 }
+
+#[test]
+fn start_accepts_no_mux_flag() {
+    let h = Harness::new();
+    h.config_set_base_dir();
+    h.config_set_username("alice");
+    h.add_repo("frontend", "");
+
+    h.cmd()
+        .args([
+            "start",
+            "PROJ-1",
+            "--repos",
+            "frontend",
+            "--no-editor",
+            "--no-mux",
+        ])
+        .assert()
+        .success();
+}

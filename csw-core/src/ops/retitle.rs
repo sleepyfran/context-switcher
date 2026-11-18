@@ -1,11 +1,11 @@
 //! `csw retitle` — change a task's title after it's been started.
 //!
 //! Updates every per-repo sidecar that exists for the task, then refreshes
-//! the CMux workspace label (when running inside CMux). The sidecar phase is
-//! best-effort per repo, mirroring `start`'s `Report` shape; the CMux phase
-//! is soft-fail, matching `start`/`done`.
+//! the multiplexer workspace label (when running inside one). The sidecar
+//! phase is best-effort per repo, mirroring `start`'s `Report` shape; the
+//! multiplexer phase is soft-fail, matching `start`/`done`.
 
-use crate::cmux::{self, CmuxOutcome};
+use crate::mux::{self, MuxOutcome};
 use crate::ops::list::{self, ListRequest};
 use crate::progress::Reporter;
 use crate::sidecar::{self, Sidecar};
@@ -20,8 +20,8 @@ pub struct RetitleRequest {
     /// New title. `None` (or any all-whitespace input the caller normalises
     /// to `None`) clears the title.
     pub title: Option<String>,
-    /// Suppress the CMux rename for this run, even when csw is inside CMux.
-    pub no_cmux: bool,
+    /// Suppress the multiplexer rename for this run.
+    pub no_mux: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +41,7 @@ pub struct RetitleReport {
     pub new_title: Option<String>,
     pub successes: Vec<RetitleSuccess>,
     pub failures: Vec<(String, anyhow::Error)>,
-    pub cmux: CmuxOutcome,
+    pub mux: MuxOutcome,
 }
 
 impl RetitleReport {
@@ -51,7 +51,7 @@ impl RetitleReport {
 }
 
 /// Normalise a user-supplied title: trim whitespace, treat empty as `None`.
-/// Matches CMux's own `workspace_name_for` semantics so the sidecar and
+/// Matches the multiplexer's `workspace_name_for` semantics so the sidecar and
 /// workspace label can never disagree about "is there a title".
 pub fn normalise_title(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim)
@@ -90,7 +90,7 @@ pub fn retitle(
         new_title: new_title.clone(),
         successes: Vec::new(),
         failures: Vec::new(),
-        cmux: CmuxOutcome::NotApplicable,
+        mux: MuxOutcome::NotApplicable,
     };
 
     for repo_entry in &entry.repos {
@@ -116,7 +116,7 @@ pub fn retitle(
         }
     }
 
-    report.cmux = finalize_cmux(cfg, &request, new_title.as_deref());
+    report.mux = finalize_mux(cfg, &request, new_title.as_deref());
     Ok(report)
 }
 
@@ -149,11 +149,14 @@ fn update_sidecar(
     Ok(previous_title)
 }
 
-fn finalize_cmux(cfg: &Config, request: &RetitleRequest, new_title: Option<&str>) -> CmuxOutcome {
-    if request.no_cmux || !cfg.cmux_enabled() || !cmux::detect() {
-        return CmuxOutcome::NotApplicable;
+fn finalize_mux(cfg: &Config, request: &RetitleRequest, new_title: Option<&str>) -> MuxOutcome {
+    if request.no_mux {
+        return MuxOutcome::NotApplicable;
     }
-    cmux::rename(&request.task_id, new_title)
+    match mux::provider_for(cfg) {
+        Some(provider) => mux::rename(provider, &request.task_id, new_title),
+        None => MuxOutcome::NotApplicable,
+    }
 }
 
 #[cfg(test)]
@@ -193,7 +196,7 @@ mod tests {
                 default_repos: vec![],
                 agent: None,
                 detached_editor: true,
-                cmux: None,
+                mux: None,
                 repos: BTreeMap::new(),
             };
             Self {
@@ -247,7 +250,7 @@ mod tests {
                 title: title.map(String::from),
                 spawn_editor: false,
                 skip_hooks: false,
-                no_cmux: true,
+                no_mux: true,
                 force_new_workspace: false,
                 branch_overrides: BTreeMap::new(),
             };
@@ -300,7 +303,7 @@ mod tests {
                 task_id: "PROJ-1".into(),
                 user: h.user.clone(),
                 title: Some("New title".into()),
-                no_cmux: true,
+                no_mux: true,
             },
             &NullReporter,
         )
@@ -331,7 +334,7 @@ mod tests {
                 task_id: "PROJ-1".into(),
                 user: h.user.clone(),
                 title: Some("".into()),
-                no_cmux: true,
+                no_mux: true,
             },
             &NullReporter,
         )
@@ -356,7 +359,7 @@ mod tests {
                 task_id: "PROJ-2".into(),
                 user: h.user.clone(),
                 title: Some("New".into()),
-                no_cmux: true,
+                no_mux: true,
             },
             &NullReporter,
         )
@@ -383,7 +386,7 @@ mod tests {
                 task_id: "MISSING-1".into(),
                 user: h.user.clone(),
                 title: Some("nope".into()),
-                no_cmux: true,
+                no_mux: true,
             },
             &NullReporter,
         )
@@ -408,7 +411,7 @@ mod tests {
                 task_id: "PROJ-3".into(),
                 user: h.user.clone(),
                 title: Some("Recovered".into()),
-                no_cmux: true,
+                no_mux: true,
             },
             &NullReporter,
         )
@@ -436,7 +439,7 @@ mod tests {
                 task_id: "PROJ-4".into(),
                 user: h.user.clone(),
                 title: Some("Recovered".into()),
-                no_cmux: true,
+                no_mux: true,
             },
             &NullReporter,
         )
@@ -448,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn retitle_skips_cmux_when_no_cmux_set() {
+    fn retitle_skips_mux_when_no_mux_set() {
         let mut h = Harness::new();
         h.add_repo("fe");
         h.start_task("PROJ-5", &["fe"], None);
@@ -458,11 +461,11 @@ mod tests {
                 task_id: "PROJ-5".into(),
                 user: h.user.clone(),
                 title: Some("Hi".into()),
-                no_cmux: true,
+                no_mux: true,
             },
             &NullReporter,
         )
         .unwrap();
-        assert_eq!(report.cmux, CmuxOutcome::NotApplicable);
+        assert_eq!(report.mux, MuxOutcome::NotApplicable);
     }
 }

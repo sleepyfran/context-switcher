@@ -133,7 +133,14 @@ fn set_additional_panels_updates_repo() {
         .success();
 
     csw(&home, &xdg)
-        .args(["config", "repo", "set", "frontend", "additional_panels", "2"])
+        .args([
+            "config",
+            "repo",
+            "set",
+            "frontend",
+            "additional_panels",
+            "2",
+        ])
         .assert()
         .success();
 
@@ -162,7 +169,14 @@ fn set_additional_panels_rejects_non_integer() {
         .success();
 
     csw(&home, &xdg)
-        .args(["config", "repo", "set", "frontend", "additional_panels", "nope"])
+        .args([
+            "config",
+            "repo",
+            "set",
+            "frontend",
+            "additional_panels",
+            "nope",
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -261,15 +275,14 @@ fn default_with_unknown_repo_fails_and_does_not_persist() {
 }
 
 #[test]
-fn cmux_block_in_config_round_trips_through_show() {
+fn legacy_cmux_block_is_read_as_mux() {
     let home = TempDir::new().unwrap();
     let xdg = TempDir::new().unwrap();
 
     // Lay down a config by hand. We exercise the file-edit path the way a
     // user would: edit the TOML, then verify `csw config show` echoes it
-    // back. The cmux layout is fixed now (no per-repo panes) — only the
-    // global enable/adoption knobs and the top-level agent/editor settings
-    // are configurable.
+    // back. Older configs used a `[cmux]` table; it's still accepted and is
+    // surfaced (and later saved) under its new `[mux]` name.
     let cfg_dir = xdg.path().join("context-switcher");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     std::fs::write(
@@ -281,6 +294,7 @@ detached_editor = true
 
 [cmux]
 enabled = true
+replace_simple_workspace = false
 
 [repos.frontend]
 path = "frontend"
@@ -298,7 +312,12 @@ editor = "zed {path}"
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains(r#"agent = "claude""#), "{stdout}");
     assert!(stdout.contains("detached_editor = true"), "{stdout}");
-    assert!(stdout.contains("[cmux]"), "{stdout}");
+    assert!(stdout.contains("[mux]"), "{stdout}");
+    assert!(!stdout.contains("[cmux]"), "{stdout}");
+    assert!(
+        stdout.contains("replace_simple_workspace = false"),
+        "{stdout}"
+    );
     assert!(stdout.contains(r#""zed {path}""#), "{stdout}");
 }
 
@@ -341,5 +360,35 @@ fn set_detached_editor_rejects_non_bool() {
         .args(["config", "set", "detached_editor", "nope"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("detached_editor must be true or false"));
+        .stderr(predicate::str::contains(
+            "detached_editor must be true or false",
+        ));
+}
+
+#[test]
+fn set_mux_provider_updates_config() {
+    let home = TempDir::new().unwrap();
+    let xdg = TempDir::new().unwrap();
+
+    csw(&home, &xdg)
+        .args(["config", "set", "mux_provider", "rex"])
+        .assert()
+        .success();
+
+    let out = csw(&home, &xdg).args(["config", "show"]).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("[mux]"), "{stdout}");
+    assert!(stdout.contains(r#"provider = "rex""#), "{stdout}");
+}
+
+#[test]
+fn set_mux_provider_rejects_unknown_provider() {
+    let home = TempDir::new().unwrap();
+    let xdg = TempDir::new().unwrap();
+
+    csw(&home, &xdg)
+        .args(["config", "set", "mux_provider", "tmux"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("expected: auto | cmux | rex"));
 }

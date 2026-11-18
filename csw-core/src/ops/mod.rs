@@ -17,7 +17,9 @@ pub mod status;
 pub use done::{BlockingIssue, DonePlan, DoneReport, DoneRequest, UnmergedWarning, WorktreeState};
 pub use fetch::{FetchReport, FetchRequest, FetchSuccess};
 pub use list::{ListRequest, RepoEntry, TaskEntry};
-pub use migrate::{LegacyRepo, LegacyTask, MigrateReport, legacy_warning, migrate_one, scan_legacy};
+pub use migrate::{
+    LegacyRepo, LegacyTask, MigrateReport, legacy_warning, migrate_one, scan_legacy,
+};
 pub use pull::{PullReport, PullRequest, PullSuccess};
 pub use retitle::{RetitleReport, RetitleRequest, RetitleSuccess, retitle};
 pub use start::{

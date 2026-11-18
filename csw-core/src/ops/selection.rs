@@ -59,7 +59,7 @@ mod tests {
             default_repos: default_repos.iter().map(|s| (*s).into()).collect(),
             agent: None,
             detached_editor: true,
-            cmux: None,
+            mux: None,
             repos,
         }
     }

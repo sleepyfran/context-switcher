@@ -1,5 +1,6 @@
-//! Workspace build algorithm — turns a list of repo contributors into a CMux
-//! workspace with a fixed layout: a top row of one pane per repo (running
+//! Workspace build algorithm — turns a list of repo contributors into a
+//! multiplexer workspace (a CMux workspace, a Rex session) with a fixed
+//! layout: a top row of one pane per repo (running
 //! that repo's editor, when editors are attached), and a single bottom pane
 //! running the task-level agent command, rooted at the task's root folder.
 //!
@@ -7,19 +8,21 @@
 //! exists. No reconcile — config drift since the workspace was first built
 //! is silently ignored.
 //!
-//! When `csw start` runs inside a CMux surface and the current workspace
-//! has exactly one pane and one surface (no splits, no extra tabs), the
-//! build path can opt to reshape that current workspace in place instead
-//! of opening a new sidebar entry. The current workspace is identified
-//! from the `CMUX_WORKSPACE_ID` env var; the gating is controlled by the
-//! caller (the config knob plus a per-invocation override flag).
+//! When `csw start` runs inside a multiplexer and the current workspace has
+//! exactly one pane and one surface (no splits, no extra tabs), the build
+//! path can opt to reshape that current workspace in place instead of
+//! opening a new sidebar entry. The current workspace is reported by the
+//! client ([`MuxClient::current_workspace_id`]); the gating is controlled by
+//! the caller (the config knob plus a per-invocation override flag).
 //!
 //! Every step is best-effort. The first error surfaces as a single
-//! [`CmuxError`] return; partial workspaces (e.g. half the splits applied)
+//! [`MuxError`] return; partial workspaces (e.g. half the splits applied)
 //! are left in place rather than rolled back, since the user can just close
 //! the sidebar entry by hand if it's a mess.
 
-use super::client::{CmuxClient, CmuxError, SplitDirection, SurfaceRef, shell_quote};
+use super::client::{
+    MuxClient, MuxError, SplitDirection, SurfaceInfo, SurfaceRef, Workspace, shell_quote,
+};
 use std::path::{Path, PathBuf};
 
 /// One repo's contribution to the workspace's top row.
@@ -30,7 +33,7 @@ pub struct Contributor {
     /// The repo's `editor` command. `None`/empty means the pane just `cd`s
     /// into the worktree with no command autostarting.
     pub editor_cmd: Option<String>,
-    /// Extra idle tabs (CMux surfaces) stacked behind the editor surface,
+    /// Extra idle tabs (CMux surfaces in the pane, Rex windows) for the repo,
     /// each `cd`'d into the same worktree with nothing autostarting.
     pub additional_panels: u32,
 }
@@ -84,7 +87,7 @@ impl BuildOutcome {
 /// shows up.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BuildOptions {
-    /// When true, reshape the current CMux workspace in place if it has
+    /// When true, reshape the current workspace in place if it has
     /// exactly one pane and one surface. False suppresses the adoption
     /// path and always creates a new workspace (the historical behavior).
     pub replace_simple_workspace: bool,
@@ -143,7 +146,7 @@ pub fn color_for_task(task_id: &str) -> &'static str {
 }
 
 /// Whether the layout has anything to build at all. Exposed so callers can
-/// short-circuit before connecting to CMux at all.
+/// short-circuit before connecting to the multiplexer at all.
 pub fn has_content(contributors: &[Contributor], spec: &WorkspaceSpec) -> bool {
     let has_top = spec.editors_attached && !contributors.is_empty();
     let has_bottom = spec.agent_cmd.is_some();
@@ -152,13 +155,13 @@ pub fn has_content(contributors: &[Contributor], spec: &WorkspaceSpec) -> bool {
 
 /// Build (or reuse) the workspace for this task.
 pub fn build_workspace(
-    client: &mut dyn CmuxClient,
+    client: &mut dyn MuxClient,
     task_id: &str,
     title: Option<&str>,
     contributors: &[Contributor],
     spec: &WorkspaceSpec,
     options: BuildOptions,
-) -> Result<BuildOutcome, CmuxError> {
+) -> Result<BuildOutcome, MuxError> {
     if !has_content(contributors, spec) {
         return Ok(BuildOutcome::NoContributors);
     }
@@ -179,7 +182,7 @@ pub fn build_workspace(
     // `--force-new-workspace`, and (c) the current workspace is actually
     // simple. Any failure or ambiguity falls through to the create path.
     if options.replace_simple_workspace && !options.force_new_workspace {
-        if let Some(current_id) = current_workspace_id() {
+        if let Some(current_id) = client.current_workspace_id() {
             if let Some(adopted) = try_adopt_workspace(
                 client,
                 &existing,
@@ -196,7 +199,7 @@ pub fn build_workspace(
 
     let created = client.new_workspace(&name)?;
     // Apply the accent color. Failure here is the same soft failure as any
-    // other CMux call — surfaced via the caller's `CmuxOutcome`.
+    // other multiplexer call — surfaced via the caller's `MuxOutcome`.
     client.set_workspace_color(&created.workspace_id, color_for_task(task_id))?;
 
     populate_workspace(client, &created.initial_surface, contributors, spec)?;
@@ -211,16 +214,21 @@ pub fn build_workspace(
 /// Fan repos out left-to-right off `seed`, one pane per contributor, each
 /// running its `editor_cmd`. Returns the created slots in repo order.
 fn fan_out_repos(
-    client: &mut dyn CmuxClient,
+    client: &mut dyn MuxClient,
     seed: &SurfaceRef,
     contributors: &[Contributor],
-) -> Result<Vec<SurfaceRef>, CmuxError> {
+) -> Result<Vec<SurfaceRef>, MuxError> {
     let mut slots: Vec<SurfaceRef> = Vec::with_capacity(contributors.len());
     slots.push(seed.clone());
     for prev_idx in 0..contributors.len().saturating_sub(1) {
         let anchor = slots[prev_idx].clone();
         client.focus_surface(&anchor.surface_id)?;
-        let new_slot = client.new_split(&anchor.surface_id, SplitDirection::Right)?;
+        // `anchor` holds the whole remaining width for the repos still to
+        // place; give the new pane all but one share of it so the row ends
+        // up evenly split (providers that can't size splits ignore this).
+        let remaining = (contributors.len() - prev_idx) as u32;
+        let percent = ((remaining - 1) * 100 / remaining) as u8;
+        let new_slot = client.new_split(&anchor.surface_id, SplitDirection::Right, percent)?;
         slots.push(new_slot);
     }
 
@@ -250,17 +258,17 @@ fn fan_out_repos(
 /// Lay out the workspace anchored at `seed_surface`, following `spec`:
 /// top row of repo editors, bottom agent pane, or just one of the two.
 fn populate_workspace(
-    client: &mut dyn CmuxClient,
+    client: &mut dyn MuxClient,
     seed_surface: &SurfaceRef,
     contributors: &[Contributor],
     spec: &WorkspaceSpec,
-) -> Result<(), CmuxError> {
+) -> Result<(), MuxError> {
     let has_top = spec.editors_attached && !contributors.is_empty();
     let has_bottom = spec.agent_cmd.is_some();
 
     if has_top && has_bottom {
         client.focus_surface(&seed_surface.surface_id)?;
-        let bottom = client.new_split(&seed_surface.surface_id, SplitDirection::Down)?;
+        let bottom = client.new_split(&seed_surface.surface_id, SplitDirection::Down, 50)?;
         let top_slots = fan_out_repos(client, seed_surface, contributors)?;
         let agent_text = pane_command(&spec.task_root, spec.agent_cmd.as_deref());
         client.send(&bottom.surface_id, &agent_text)?;
@@ -279,20 +287,20 @@ fn populate_workspace(
 
 /// Attempt to reshape the given workspace in place. Returns
 /// `Ok(Some(Adopted))` on success, `Ok(None)` when the workspace doesn't
-/// exist on the CMux side or isn't simple enough to adopt, or `Err(...)`
-/// if a CMux call genuinely failed.
+/// exist on the multiplexer side or isn't simple enough to adopt, or `Err(...)`
+/// if a multiplexer call genuinely failed.
 #[allow(clippy::too_many_arguments)]
 fn try_adopt_workspace(
-    client: &mut dyn CmuxClient,
-    existing: &[super::client::Workspace],
+    client: &mut dyn MuxClient,
+    existing: &[Workspace],
     current_id: &str,
     task_id: &str,
     name: &str,
     contributors: &[Contributor],
     spec: &WorkspaceSpec,
-) -> Result<Option<BuildOutcome>, CmuxError> {
+) -> Result<Option<BuildOutcome>, MuxError> {
     // The env var should always point at one of the listed workspaces; if
-    // it doesn't (e.g. CMux closed it from under us), fall back to create
+    // it doesn't (e.g. it was closed from under us), fall back to create
     // rather than risk renaming the wrong workspace.
     if !existing.iter().any(|w| w.id == current_id) {
         return Ok(None);
@@ -314,24 +322,17 @@ fn try_adopt_workspace(
     }))
 }
 
-/// `CMUX_WORKSPACE_ID` as a non-empty string. Empty values (some CMux
-/// builds export the var blank) are treated as absent.
-fn current_workspace_id() -> Option<String> {
-    let raw = std::env::var(super::WORKSPACE_ENV_VAR).ok()?;
-    if raw.is_empty() { None } else { Some(raw) }
-}
-
 /// Return the single surface of a workspace iff it qualifies as "simple":
 /// exactly one surface, in exactly one pane. Anything else (zero, multiple
 /// surfaces, multiple distinct panes) returns `None`.
-fn simple_workspace_surface(surfaces: &[super::client::SurfaceInfo]) -> Option<SurfaceRef> {
+fn simple_workspace_surface(surfaces: &[SurfaceInfo]) -> Option<SurfaceRef> {
     if surfaces.len() != 1 {
         return None;
     }
     let only = &surfaces[0];
     // Belt-and-suspenders: also confirm there's exactly one pane. A single
     // surface should already imply a single pane, but this guards against
-    // a future CMux that reports surfaces differently.
+    // a provider that reports surfaces differently.
     let mut pane_ids = std::collections::BTreeSet::new();
     for s in surfaces {
         pane_ids.insert(&s.surface_ref.pane_id);
@@ -361,7 +362,7 @@ fn pane_command(worktree: &Path, cmd: Option<&str>) -> String {
 /// task-id-prefix rule [`build_workspace`] uses for lookup. Returns
 /// `Ok(true)` if something was closed, `Ok(false)` if no matching workspace
 /// was found.
-pub fn close_workspace_for(client: &mut dyn CmuxClient, task_id: &str) -> Result<bool, CmuxError> {
+pub fn close_workspace_for(client: &mut dyn MuxClient, task_id: &str) -> Result<bool, MuxError> {
     let existing = client.list_workspaces()?;
     let Some(ws) = existing
         .into_iter()
@@ -378,10 +379,10 @@ pub fn close_workspace_for(client: &mut dyn CmuxClient, task_id: &str) -> Result
 /// just the task id. Returns the new name on success, or `Ok(None)` if no
 /// matching workspace was found.
 pub fn rename_workspace_for(
-    client: &mut dyn CmuxClient,
+    client: &mut dyn MuxClient,
     task_id: &str,
     title: Option<&str>,
-) -> Result<Option<String>, CmuxError> {
+) -> Result<Option<String>, MuxError> {
     let existing = client.list_workspaces()?;
     let Some(ws) = existing
         .into_iter()
@@ -397,8 +398,8 @@ pub fn rename_workspace_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmux::client::Workspace;
-    use crate::cmux::client::testing::{Call, RecordingClient};
+    use crate::mux::client::Workspace;
+    use crate::mux::client::testing::{Call, RecordingClient};
     use std::path::PathBuf;
 
     fn contributor(name: &str, worktree: &str, editor_cmd: Option<&str>) -> Contributor {
@@ -442,9 +443,15 @@ mod tests {
     fn no_content_short_circuits_without_calls() {
         let mut client = RecordingClient::new();
         let spec = detached_spec("/csw/tasks/alice-PROJ-1", None);
-        let outcome =
-            build_workspace(&mut client, "PROJ-1", None, &[], &spec, BuildOptions::default())
-                .unwrap();
+        let outcome = build_workspace(
+            &mut client,
+            "PROJ-1",
+            None,
+            &[],
+            &spec,
+            BuildOptions::default(),
+        )
+        .unwrap();
         assert_eq!(outcome, BuildOutcome::NoContributors);
         assert!(client.calls().is_empty());
     }
@@ -596,12 +603,13 @@ mod tests {
         .unwrap();
 
         // No down-split since there's no agent to seat at the bottom.
-        assert!(
-            !client
-                .calls()
-                .iter()
-                .any(|c| matches!(c, Call::NewSplit { direction: SplitDirection::Down, .. }))
-        );
+        assert!(!client.calls().iter().any(|c| matches!(
+            c,
+            Call::NewSplit {
+                direction: SplitDirection::Down,
+                ..
+            }
+        )));
         let send = client
             .calls()
             .into_iter()
@@ -637,7 +645,15 @@ mod tests {
         let down_splits: Vec<_> = client
             .calls()
             .into_iter()
-            .filter(|c| matches!(c, Call::NewSplit { direction: SplitDirection::Down, .. }))
+            .filter(|c| {
+                matches!(
+                    c,
+                    Call::NewSplit {
+                        direction: SplitDirection::Down,
+                        ..
+                    }
+                )
+            })
             .collect();
         assert_eq!(down_splits.len(), 1, "expected exactly one down-split");
 
@@ -679,9 +695,64 @@ mod tests {
         let right_splits: Vec<_> = client
             .calls()
             .into_iter()
-            .filter(|c| matches!(c, Call::NewSplit { direction: SplitDirection::Right, .. }))
+            .filter(|c| {
+                matches!(
+                    c,
+                    Call::NewSplit {
+                        direction: SplitDirection::Right,
+                        ..
+                    }
+                )
+            })
             .collect();
-        assert_eq!(right_splits.len(), 1, "two repos need exactly one right-split");
+        assert_eq!(
+            right_splits.len(),
+            1,
+            "two repos need exactly one right-split"
+        );
+    }
+
+    #[test]
+    fn top_row_splits_request_even_widths_and_agent_gets_half() {
+        let mut client = RecordingClient::new();
+        let contribs = vec![
+            contributor("a", "/t/a", None),
+            contributor("b", "/t/b", None),
+            contributor("c", "/t/c", None),
+        ];
+        let spec = attached_spec("/t", Some("claude"));
+
+        build_workspace(
+            &mut client,
+            "PROJ-1",
+            None,
+            &contribs,
+            &spec,
+            BuildOptions::default(),
+        )
+        .unwrap();
+
+        let percents: Vec<(SplitDirection, u8)> = client
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::NewSplit {
+                    direction, percent, ..
+                } => Some((direction, percent)),
+                _ => None,
+            })
+            .collect();
+        // Bottom agent pane first, then each right split takes all but one
+        // share of what's left: 3 → 66% (2/3), 2 → 50% (1/2). Every repo
+        // ends up with a third of the row.
+        assert_eq!(
+            percents,
+            [
+                (SplitDirection::Down, 50),
+                (SplitDirection::Right, 66),
+                (SplitDirection::Right, 50),
+            ]
+        );
     }
 
     #[test]
@@ -730,7 +801,11 @@ mod tests {
     #[test]
     fn zero_additional_panels_opens_no_extra_tabs() {
         let mut client = RecordingClient::new();
-        let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", Some("nvim"))];
+        let contribs = vec![contributor(
+            "fe",
+            "/csw/tasks/alice-PROJ-1/fe",
+            Some("nvim"),
+        )];
         let spec = attached_spec("/csw/tasks/alice-PROJ-1", None);
 
         build_workspace(
@@ -773,7 +848,12 @@ mod tests {
         assert!(matches!(outcome, BuildOutcome::Created { .. }));
 
         // No splits at all — single full pane.
-        assert!(!client.calls().iter().any(|c| matches!(c, Call::NewSplit { .. })));
+        assert!(
+            !client
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::NewSplit { .. }))
+        );
         let send = client
             .calls()
             .into_iter()
@@ -893,35 +973,6 @@ mod tests {
     }
 
     // ---- in-place adoption -------------------------------------------------
-
-    use crate::cmux::client::SurfaceInfo;
-    use std::sync::Mutex;
-
-    /// Tests that mutate `CMUX_WORKSPACE_ID` need to be serialised so they
-    /// don't trample each other's env-var setup when cargo runs tests in
-    /// parallel. The actual env-var read/write stays `unsafe` (it's
-    /// process-wide state) but this guard ensures no two tests in this
-    /// module are racing over the same key simultaneously.
-    static ENV_VAR_GUARD: Mutex<()> = Mutex::new(());
-
-    /// Acquire the env-var guard, set `CMUX_WORKSPACE_ID = value`, run
-    /// `body`, then restore the prior value. The guard is held for the
-    /// entire critical section. Returns whatever `body` returns.
-    fn with_workspace_env_var<R>(value: &str, body: impl FnOnce() -> R) -> R {
-        let _lock = ENV_VAR_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = std::env::var_os(super::super::WORKSPACE_ENV_VAR);
-        unsafe {
-            std::env::set_var(super::super::WORKSPACE_ENV_VAR, value);
-        }
-        let result = body();
-        unsafe {
-            match previous {
-                Some(v) => std::env::set_var(super::super::WORKSPACE_ENV_VAR, v),
-                None => std::env::remove_var(super::super::WORKSPACE_ENV_VAR),
-            }
-        }
-        result
-    }
 
     fn simple_surface(id: &str) -> SurfaceInfo {
         SurfaceInfo {
@@ -1088,8 +1139,9 @@ mod tests {
             name: "scratch".into(),
         };
 
-        let outcome = with_workspace_env_var("ws-current", || {
+        let outcome = {
             let mut client = RecordingClient::new()
+                .with_current_workspace("ws-current")
                 .with_existing(vec![workspace.clone()])
                 .with_workspace_surfaces("ws-current", vec![simple_surface("a")]);
             let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
@@ -1107,7 +1159,7 @@ mod tests {
             )
             .unwrap();
             (outcome, client.calls())
-        });
+        };
 
         assert!(matches!(outcome.0, BuildOutcome::Created { .. }));
         assert!(
@@ -1125,8 +1177,9 @@ mod tests {
             name: "scratch".into(),
         };
 
-        let outcome = with_workspace_env_var("ws-current", || {
+        let outcome = {
             let mut client = RecordingClient::new()
+                .with_current_workspace("ws-current")
                 .with_existing(vec![workspace.clone()])
                 .with_workspace_surfaces("ws-current", vec![simple_surface("a")]);
             let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
@@ -1144,7 +1197,7 @@ mod tests {
             )
             .unwrap();
             (outcome, client.calls())
-        });
+        };
 
         assert!(matches!(outcome.0, BuildOutcome::Created { .. }));
         assert!(
@@ -1162,17 +1215,24 @@ mod tests {
             name: "scratch".into(),
         };
 
-        let outcome = with_workspace_env_var("ws-current", || {
+        let outcome = {
             let mut client = RecordingClient::new()
+                .with_current_workspace("ws-current")
                 .with_existing(vec![workspace.clone()])
                 .with_workspace_surfaces("ws-current", vec![simple_surface("a")]);
             let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
             let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
-            let outcome =
-                build_workspace(&mut client, "PROJ-1", None, &contribs, &spec, adopt_options())
-                    .unwrap();
+            let outcome = build_workspace(
+                &mut client,
+                "PROJ-1",
+                None,
+                &contribs,
+                &spec,
+                adopt_options(),
+            )
+            .unwrap();
             (outcome, client.calls())
-        });
+        };
 
         assert!(matches!(
             outcome.0,
@@ -1197,17 +1257,24 @@ mod tests {
             name: "scratch".into(),
         };
 
-        let outcome = with_workspace_env_var("ws-current", || {
+        let outcome = {
             let mut client = RecordingClient::new()
+                .with_current_workspace("ws-current")
                 .with_existing(vec![existing_match, current])
                 .with_workspace_surfaces("ws-current", vec![simple_surface("a")]);
             let contribs = vec![contributor("fe", "/csw/tasks/alice-PROJ-1/fe", None)];
             let spec = attached_spec("/csw/tasks/alice-PROJ-1", Some("claude"));
-            let outcome =
-                build_workspace(&mut client, "PROJ-1", None, &contribs, &spec, adopt_options())
-                    .unwrap();
+            let outcome = build_workspace(
+                &mut client,
+                "PROJ-1",
+                None,
+                &contribs,
+                &spec,
+                adopt_options(),
+            )
+            .unwrap();
             (outcome, client.calls())
-        });
+        };
 
         assert!(matches!(
             outcome.0,

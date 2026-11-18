@@ -3,6 +3,7 @@ use crate::output;
 use anyhow::{Context, Result, bail};
 use csw_core::config::{Config, RepoConfig, config_path, expand_home};
 use csw_core::hooks::{CopyAction, HookAction, RunAction, RunCwd};
+use csw_core::mux::{MuxConfig, ProviderChoice};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Select};
 use std::path::{Component, Path, PathBuf};
@@ -54,8 +55,12 @@ fn set(key: &str, value: &str) -> Result<()> {
                 .parse()
                 .map_err(|_| anyhow::anyhow!("detached_editor must be true or false"))?;
         }
+        "mux_provider" => {
+            let provider: ProviderChoice = value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            cfg.mux.get_or_insert_with(MuxConfig::default).provider = provider;
+        }
         other => bail!(
-            "unknown key '{other}' (expected: base_dir | tasks_dir | username | default_repos | agent | detached_editor)"
+            "unknown key '{other}' (expected: base_dir | tasks_dir | username | default_repos | agent | detached_editor | mux_provider)"
         ),
     }
     cfg.save()?;

@@ -7,9 +7,9 @@
 //!     returned [`StartReport`] but don't abort siblings — the caller decides
 //!     the exit code.
 
-use crate::cmux::{self, BuildOptions, CmuxOutcome, Contributor, WorkspaceSpec};
 use crate::errors::CswError;
 use crate::hooks::{self, HookContext};
+use crate::mux::{self, BuildOptions, Contributor, MuxOutcome, WorkspaceSpec};
 use crate::progress::{RepoProgress, Reporter};
 use crate::{Config, RepoConfig, editor, git, paths, sidecar, sidecar::Sidecar};
 use anyhow::{Context, Result, anyhow};
@@ -24,12 +24,12 @@ pub struct StartRequest {
     pub title: Option<String>,
     pub spawn_editor: bool,
     pub skip_hooks: bool,
-    /// Suppress the CMux integration for this run, even when csw is invoked
-    /// from inside a CMux surface and the configuration enables it.
-    pub no_cmux: bool,
-    /// Skip the in-place adoption of a simple current CMux workspace,
+    /// Suppress the multiplexer integration for this run, even when csw is
+    /// invoked from inside one and the configuration enables it.
+    pub no_mux: bool,
+    /// Skip the in-place adoption of a simple current workspace,
     /// forcing a brand-new workspace to be created instead. Overrides the
-    /// `cmux.replace_simple_workspace` config knob for this invocation.
+    /// `mux.replace_simple_workspace` config knob for this invocation.
     pub force_new_workspace: bool,
     /// Per-repo branch overrides. When a repo's name appears here, the
     /// effective branch for that repo's worktree is the override instead of
@@ -47,7 +47,7 @@ pub enum StartAction {
 pub enum EditorStatus {
     /// Launched as a detached process (`detached_editor = true`).
     Spawned,
-    /// Will be launched as a CMux pane by the task-level `finalize_cmux`
+    /// Will be launched as a multiplexer pane by the task-level `finalize_mux`
     /// step, once every repo has finished starting (the default).
     Attached,
     Skipped,
@@ -69,9 +69,9 @@ pub struct StartReport {
     pub user: String,
     pub successes: Vec<StartSuccess>,
     pub failures: Vec<(String, anyhow::Error)>,
-    /// Outcome of the CMux integration, if it ran. Never influences the
+    /// Outcome of the multiplexer integration, if it ran. Never influences the
     /// exit code — purely informational for the renderer.
-    pub cmux: CmuxOutcome,
+    pub mux: MuxOutcome,
 }
 
 impl StartReport {
@@ -108,7 +108,7 @@ pub fn start(cfg: &Config, request: StartRequest, reporter: &dyn Reporter) -> Re
         user: request.user.clone(),
         successes: Vec::new(),
         failures: Vec::new(),
-        cmux: CmuxOutcome::NotApplicable,
+        mux: MuxOutcome::NotApplicable,
     };
 
     for plan in plans {
@@ -136,26 +136,30 @@ pub fn start(cfg: &Config, request: StartRequest, reporter: &dyn Reporter) -> Re
         }
     }
 
-    report.cmux = finalize_cmux(cfg, &request, &report.successes);
+    report.mux = finalize_mux(cfg, &request, &report.successes);
 
     Ok(report)
 }
 
-/// Task-level CMux finalization. Runs only if csw is inside a CMux surface,
-/// the global config doesn't disable the integration, and `--no-cmux` wasn't
-/// passed. Builds (or reuses) `csw/<task-id>` from the participating repos.
+/// Task-level multiplexer finalization. Runs only if csw is inside a
+/// supported multiplexer, the global config doesn't disable the integration,
+/// and `--no-mux` wasn't passed. Builds (or reuses) the task's workspace
+/// from the participating repos.
 /// Failure is always soft — the returned outcome never influences exit code.
-fn finalize_cmux(cfg: &Config, request: &StartRequest, successes: &[StartSuccess]) -> CmuxOutcome {
-    if request.no_cmux || !cfg.cmux_enabled() || !cmux::detect() {
-        return CmuxOutcome::NotApplicable;
+fn finalize_mux(cfg: &Config, request: &StartRequest, successes: &[StartSuccess]) -> MuxOutcome {
+    if request.no_mux {
+        return MuxOutcome::NotApplicable;
     }
-    let contributors = cmux_contributors(cfg, successes);
+    let Some(provider) = mux::provider_for(cfg) else {
+        return MuxOutcome::NotApplicable;
+    };
+    let contributors = mux_contributors(cfg, successes);
     // Prefer the title from this invocation. If absent (e.g. a bare resume
     // a day later), recover the title that was stored in any of the task's
     // sidecars at create time so the workspace label stays stable.
     let title = request.title.clone().or_else(|| sidecar_title(successes));
     let options = BuildOptions {
-        replace_simple_workspace: cfg.cmux_replace_simple_workspace(),
+        replace_simple_workspace: cfg.mux_replace_simple_workspace(),
         force_new_workspace: request.force_new_workspace,
     };
     let spec = WorkspaceSpec {
@@ -163,7 +167,8 @@ fn finalize_cmux(cfg: &Config, request: &StartRequest, successes: &[StartSuccess
         agent_cmd: cfg.agent.clone(),
         editors_attached: !cfg.detached_editor,
     };
-    cmux::setup(
+    mux::setup(
+        provider,
         &request.task_id,
         title.as_deref(),
         &contributors,
@@ -184,8 +189,8 @@ fn sidecar_title(successes: &[StartSuccess]) -> Option<String> {
 
 /// Build one contributor per successfully started repo — every repo
 /// participates in the top row now (no more per-repo opt-in). Extracted
-/// from [`finalize_cmux`] so it can be unit-tested without env-var games.
-pub(crate) fn cmux_contributors(cfg: &Config, successes: &[StartSuccess]) -> Vec<Contributor> {
+/// from [`finalize_mux`] so it can be unit-tested without env-var games.
+pub(crate) fn mux_contributors(cfg: &Config, successes: &[StartSuccess]) -> Vec<Contributor> {
     successes
         .iter()
         .filter_map(|s| {
@@ -407,7 +412,7 @@ fn launch_editor(
     }
     if !cfg.detached_editor {
         // Attached (default): the pane is built later, once every repo has
-        // finished starting, by `finalize_cmux`.
+        // finished starting, by `finalize_mux`.
         return EditorStatus::Attached;
     }
     progress.step("launching editor");
@@ -447,7 +452,7 @@ mod tests {
                 default_repos: vec![],
                 agent: None,
                 detached_editor: true,
-                cmux: None,
+                mux: None,
                 repos: BTreeMap::new(),
             };
             Self {
@@ -529,7 +534,7 @@ mod tests {
             title: None,
             spawn_editor: false,
             skip_hooks: false,
-            no_cmux: true,
+            no_mux: true,
             force_new_workspace: false,
             branch_overrides: BTreeMap::new(),
         }
@@ -941,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn cmux_contributors_includes_every_successful_repo() {
+    fn mux_contributors_includes_every_successful_repo() {
         let mut s = Scaffold::new();
         s.add_repo("frontend", "zed {path}");
         s.add_repo("backend", "");
@@ -964,7 +969,7 @@ mod tests {
             },
         ];
 
-        let contribs = cmux_contributors(&s.cfg, &successes);
+        let contribs = mux_contributors(&s.cfg, &successes);
         assert_eq!(contribs.len(), 2);
         let frontend = contribs.iter().find(|c| c.repo == "frontend").unwrap();
         assert_eq!(frontend.editor_cmd.as_deref(), Some("zed {path}"));
@@ -973,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn cmux_contributors_skips_failed_repos_implicitly() {
+    fn mux_contributors_skips_failed_repos_implicitly() {
         // Failed repos never enter `successes`, so the helper only sees
         // succeeded ones.
         let mut s = Scaffold::new();
@@ -989,7 +994,7 @@ mod tests {
             editor: EditorStatus::Attached,
         }];
 
-        let contribs = cmux_contributors(&s.cfg, &successes);
+        let contribs = mux_contributors(&s.cfg, &successes);
         assert_eq!(contribs.len(), 1);
         assert_eq!(contribs[0].repo, "frontend");
     }

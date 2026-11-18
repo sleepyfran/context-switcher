@@ -2,7 +2,7 @@ mod repo;
 
 pub use repo::RepoConfig;
 
-use crate::cmux::config::GlobalCmuxConfig;
+use crate::mux::config::{MuxConfig, ProviderChoice};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -31,22 +31,24 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub default_repos: Vec<String>,
 
-    /// Command run in the bottom CMux pane, rooted at the task's root
+    /// Command run in the bottom multiplexer pane, rooted at the task's root
     /// folder (visible to every repo the task was started with). No
-    /// `{path}` placeholder — CMux always `cd`s into the task root before
+    /// `{path}` placeholder — csw always `cd`s into the task root before
     /// running it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
 
     /// When `true`, restores the legacy behavior: each repo's `editor`
     /// launches as a detached GUI process (`editor::spawn`), independent of
-    /// CMux, and no top-row editor panes are built. Defaults to `false`
-    /// (attached): editors run as CMux pane commands in the top row.
+    /// the multiplexer, and no top-row editor panes are built. Defaults to
+    /// `false` (attached): editors run as multiplexer panes in the top row.
     #[serde(default)]
     pub detached_editor: bool,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cmux: Option<GlobalCmuxConfig>,
+    /// `[mux]` table. Older configs spelled it `[cmux]`; that name is still
+    /// accepted on read and rewritten as `[mux]` on the next save.
+    #[serde(default, alias = "cmux", skip_serializing_if = "Option::is_none")]
+    pub mux: Option<MuxConfig>,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub repos: BTreeMap<String, RepoConfig>,
@@ -61,7 +63,7 @@ impl Default for Config {
             default_repos: Vec::new(),
             agent: None,
             detached_editor: false,
-            cmux: None,
+            mux: None,
             repos: BTreeMap::new(),
         }
     }
@@ -184,7 +186,8 @@ impl Config {
     /// `<tasks_dir>/<user>-<task_id>/`. Every repo the task was started
     /// with lives as a subdirectory beneath this.
     pub fn task_root(&self, user: &str, task_id: &str) -> PathBuf {
-        self.tasks_dir.join(crate::paths::worktree_dirname(user, task_id))
+        self.tasks_dir
+            .join(crate::paths::worktree_dirname(user, task_id))
     }
 
     /// Pretty TOML representation, used by `csw config show`.
@@ -192,19 +195,23 @@ impl Config {
         toml::to_string_pretty(self).context("serialising config to TOML")
     }
 
-    /// Whether the CMux integration is enabled. Default is on; an absent
-    /// `[cmux]` block reads as enabled. Only an explicit `enabled = false`
-    /// turns it off.
-    pub fn cmux_enabled(&self) -> bool {
-        self.cmux.as_ref().map(|c| c.enabled).unwrap_or(true)
+    /// Whether the multiplexer integration is enabled. Default is on; an
+    /// absent `[mux]` block reads as enabled. Only an explicit
+    /// `enabled = false` turns it off.
+    pub fn mux_enabled(&self) -> bool {
+        self.mux.as_ref().map(|c| c.enabled).unwrap_or(true)
     }
 
-    /// Whether `csw start` should reshape the current CMux workspace in
-    /// place when it's simple (single pane, single surface) instead of
-    /// creating a new sidebar entry. Defaults to on; an absent `[cmux]`
-    /// block or absent `replace_simple_workspace = ...` reads as enabled.
-    pub fn cmux_replace_simple_workspace(&self) -> bool {
-        self.cmux
+    /// Which multiplexer(s) csw may drive. Defaults to `auto`.
+    pub fn mux_provider(&self) -> ProviderChoice {
+        self.mux.as_ref().map(|c| c.provider).unwrap_or_default()
+    }
+
+    /// Whether `csw start` should reshape the current workspace in place
+    /// when it's simple (single pane, single tab) instead of creating a new
+    /// sidebar entry. Defaults to on.
+    pub fn mux_replace_simple_workspace(&self) -> bool {
+        self.mux
             .as_ref()
             .map(|c| c.replace_simple_workspace)
             .unwrap_or(true)
@@ -253,7 +260,7 @@ mod tests {
             default_repos: vec!["frontend".into()],
             agent: Some("claude".into()),
             detached_editor: true,
-            cmux: None,
+            mux: None,
             repos,
         };
 

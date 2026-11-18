@@ -9,8 +9,8 @@
 //!   set, since the working tree could have changed between calls.
 
 use crate::Config;
-use crate::cmux::{self, CmuxOutcome};
 use crate::errors::CswError;
+use crate::mux::{self, MuxOutcome};
 use crate::progress::Reporter;
 use crate::{git, paths};
 use anyhow::{Context, Result, anyhow};
@@ -22,7 +22,7 @@ pub struct DoneRequest {
     pub user: String,
     pub force: bool,
     pub keep_branch: bool,
-    /// Leave the matching CMux workspace open. Default behaviour is to
+    /// Leave the matching multiplexer workspace open. Default behaviour is to
     /// close `csw/<task-id>` after destruction so the sidebar doesn't end
     /// up with an entry pointing at deleted directories.
     pub keep_workspace: bool,
@@ -87,9 +87,9 @@ pub struct DoneReport {
     pub deleted_worktrees: Vec<PathBuf>,
     pub deleted_branches: Vec<(String, String)>, // (repo, branch)
     pub failures: Vec<(String, anyhow::Error)>,
-    /// Outcome of attempting to close the matching CMux workspace. Never
+    /// Outcome of attempting to close the matching multiplexer workspace. Never
     /// influences exit code.
-    pub cmux: CmuxOutcome,
+    pub mux: MuxOutcome,
 }
 
 impl DoneReport {
@@ -228,19 +228,22 @@ pub fn execute(
         }
     }
 
-    report.cmux = finalize_cmux(cfg, request);
+    report.mux = finalize_mux(cfg, request);
 
     Ok(report)
 }
 
-/// Task-level CMux teardown. Symmetric with `start`: only fires when csw is
-/// running inside CMux, the global config doesn't disable the integration,
+/// Task-level multiplexer teardown. Symmetric with `start`: only fires when
+/// csw is running inside a supported multiplexer, the global config doesn't disable the integration,
 /// and the user hasn't asked to keep the workspace.
-fn finalize_cmux(cfg: &Config, request: &DoneRequest) -> CmuxOutcome {
-    if request.keep_workspace || !cfg.cmux_enabled() || !cmux::detect() {
-        return CmuxOutcome::NotApplicable;
+fn finalize_mux(cfg: &Config, request: &DoneRequest) -> MuxOutcome {
+    if request.keep_workspace {
+        return MuxOutcome::NotApplicable;
     }
-    cmux::close(&request.task_id)
+    match mux::provider_for(cfg) {
+        Some(provider) => mux::close(provider, &request.task_id),
+        None => MuxOutcome::NotApplicable,
+    }
 }
 
 fn find_worktrees(cfg: &Config, user: &str, task_id: &str) -> Result<Vec<WorktreeState>> {
@@ -309,7 +312,7 @@ mod tests {
                     default_repos: vec![],
                     agent: None,
                     detached_editor: true,
-                    cmux: None,
+                    mux: None,
                     repos: BTreeMap::new(),
                 },
                 _tmp: tmp,
@@ -361,7 +364,7 @@ mod tests {
                 title: None,
                 spawn_editor: false,
                 skip_hooks: false,
-                no_cmux: true,
+                no_mux: true,
                 force_new_workspace: false,
                 branch_overrides: std::collections::BTreeMap::new(),
             };

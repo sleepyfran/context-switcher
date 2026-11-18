@@ -1,9 +1,9 @@
 use crate::cli::RetitleArgs;
 use crate::{output, progress};
 use anyhow::{Result, anyhow};
-use csw_core::cmux::CmuxOutcome;
 use csw_core::config::Config;
 use csw_core::identity;
+use csw_core::mux::MuxOutcome;
 use csw_core::ops::{self, RetitleRequest};
 use csw_core::paths;
 
@@ -37,7 +37,7 @@ pub fn run(args: RetitleArgs) -> Result<i32> {
         task_id: task_id.clone(),
         user: user.clone(),
         title: Some(title),
-        no_cmux: args.no_cmux,
+        no_mux: args.no_mux,
     };
 
     output::step(format!("retitling {user}/{task_id}"));
@@ -49,7 +49,7 @@ pub fn run(args: RetitleArgs) -> Result<i32> {
         output::error(format!("{repo}: {err:#}"));
     }
     render_title_change(&report);
-    render_cmux(&report.cmux);
+    render_mux(&report.mux);
 
     if report.any_failure() { Ok(2) } else { Ok(0) }
 }
@@ -63,17 +63,20 @@ fn render_title_change(report: &ops::RetitleReport) {
     ));
 }
 
-fn render_cmux(outcome: &CmuxOutcome) {
+fn render_mux(outcome: &MuxOutcome) {
     match outcome {
-        CmuxOutcome::NotApplicable | CmuxOutcome::NotRenamed => {}
-        CmuxOutcome::Renamed { name } => output::step(format!("cmux: workspace renamed: {name}")),
-        CmuxOutcome::Warned(msg) => output::warn(msg.clone()),
+        MuxOutcome::NotApplicable | MuxOutcome::NotRenamed => {}
+        MuxOutcome::Renamed { provider, name } => output::step(format!(
+            "{provider}: {} renamed: {name}",
+            provider.workspace_noun()
+        )),
+        MuxOutcome::Warned(msg) => output::warn(msg.clone()),
         // retitle should never produce these outcomes.
-        CmuxOutcome::Created { .. }
-        | CmuxOutcome::Adopted { .. }
-        | CmuxOutcome::Reused { .. }
-        | CmuxOutcome::Closed { .. }
-        | CmuxOutcome::NotClosed
-        | CmuxOutcome::NoContributors => {}
+        MuxOutcome::Created { .. }
+        | MuxOutcome::Adopted { .. }
+        | MuxOutcome::Reused { .. }
+        | MuxOutcome::Closed { .. }
+        | MuxOutcome::NotClosed
+        | MuxOutcome::NoContributors => {}
     }
 }

@@ -1,10 +1,10 @@
 # csw
 
-A Rust CLI I built for myself. It wraps `git worktree` for tasks that span one or more repos, with hooks for the rest of my workflow: CMux workspace orchestration, an agent that gets dropped into the task root, and whatever else I might add later.
+A Rust CLI I built for myself. It wraps `git worktree` for tasks that span one or more repos, with hooks for the rest of my workflow: terminal multiplexer orchestration (CMux or Rex), an agent that gets dropped into the task root, and whatever else I might add later.
 
 ## Why it exists
 
-Since I started using agentic coding more and more I find myself doing a lot of switching in between different contexts. These contexts usually includes different repos checked-out on different tasks and since, _gasp_, I still want to be in control of the code I output I end up always switching branches, retesting here and there... It was just too messy to keep track of by hand, so that's where `csw` enters the picture. One command spins up worktrees for as many repos as the task touches, copies what needs copying, runs whatever needs running, opens the editors, drops an agent into the task root with visibility of every repo, builds the CMux workspace. One command tears it all down. Worktrees are just plumbing; what I actually keep adding to is the integration layer (post-create hooks, CMux layout, the agent pane).
+Since I started using agentic coding more and more I find myself doing a lot of switching in between different contexts. These contexts usually includes different repos checked-out on different tasks and since, _gasp_, I still want to be in control of the code I output I end up always switching branches, retesting here and there... It was just too messy to keep track of by hand, so that's where `csw` enters the picture. One command spins up worktrees for as many repos as the task touches, copies what needs copying, runs whatever needs running, opens the editors, drops an agent into the task root with visibility of every repo, builds the multiplexer workspace. One command tears it all down. Worktrees are just plumbing; what I actually keep adding to is the integration layer (post-create hooks, multiplexer layout, the agent pane).
 
 ## How it works
 
@@ -75,7 +75,7 @@ That puts a `csw` binary at `~/.cargo/bin` (which you'll want on `$PATH`). You a
    csw config repo default frontend
    ```
 
-6. Optionally set the agent command that gets dropped into the task root on `csw start` (see [CMux integration](#cmux-integration)):
+6. Optionally set the agent command that gets dropped into the task root on `csw start` (see [Multiplexer integration](#multiplexer-integration-cmux-rex)):
 
    ```sh
    csw config set agent claude
@@ -165,7 +165,7 @@ csw done PROJ-123
 csw done                    # infers from cwd
 csw done PROJ-123 --force   # bypass safety checks (irrevocable; the branch's only copy goes too)
 csw done PROJ-123 --keep-branch     # leave the branch behind in the canonical
-csw done PROJ-123 --keep-workspace  # don't close the matching CMux workspace
+csw done PROJ-123 --keep-workspace  # don't close the matching CMux workspace / Rex session
 ```
 
 If the branch is pushed but not merged into your base branch, csw warns and prompts before removing. Pass `--yes` to skip the prompt.
@@ -207,7 +207,7 @@ csw config repo set api base_branch main
 csw config repo set api additional_panels 2
 ```
 
-`additional_panels` opens that many extra idle tabs (CMux surfaces) behind the repo's editor pane in the top row — each just `cd`'d into the repo's worktree, nothing autostarting. Switch between them with ⌘[ / ⌘]. Only takes effect when editors are attached (see [CMux integration](#cmux-integration)); it's ignored with `detached_editor = true` since there's no editor pane to attach tabs to.
+`additional_panels` opens that many extra idle tabs for the repo — each just `cd`'d into the repo's worktree, nothing autostarting. On CMux they're surfaces stacked behind the repo's editor pane (switch with ⌘[ / ⌘]); on Rex they're extra windows in the task's session. Only takes effect when editors are attached (see [Multiplexer integration](#multiplexer-integration-cmux-rex)); it's ignored with `detached_editor = true` since there's no editor pane to attach tabs to.
 
 Remove a repo:
 
@@ -299,15 +299,39 @@ csw config edit
 
 That opens the config in `$VISUAL` / `$EDITOR` / `vi`, validates that the result still parses, and refuses to swap it in if you've broken the syntax. Your original file stays untouched on a parse failure.
 
-## CMux integration
+## Multiplexer integration (CMux, Rex)
 
-If you use [CMux](https://cmux.com) as your terminal multiplexer, csw can spin up a workspace each time you `csw start`: one sidebar entry per task, laid out as a top row of editor panes plus a bottom agent pane, with a deterministic accent color. `csw done` closes that workspace alongside the disk cleanup.
+If you use a supported terminal multiplexer, either [CMux](https://cmux.com) or [Rex](https://www.superlogical.com/rex), csw can spin up a workspace each time you `csw start`: one sidebar entry per task, laid out as a top row of editor panes plus a bottom agent pane. `csw done` closes that workspace alongside the disk cleanup.
 
-The integration activates only when csw notices it's running inside a CMux surface (the `CMUX_WORKSPACE_ID` env var that CMux auto-exports). Outside CMux it's a complete no-op; nothing about your config or workflow changes for non-CMux callers.
+Each multiplexer has its own name for things. What csw calls a *workspace* is a CMux workspace or a Rex **session**, and output uses the provider's own term (`rex: opened session PROJ-123`).
+
+### Picking a provider
+
+The integration activates only when csw notices it's running inside a supported multiplexer, using the env var each one exports into its terminals:
+
+| Provider | Detected by         | Talks to it via                     |
+|----------|---------------------|-------------------------------------|
+| Rex      | `REX_SESSION`       | the `rex` CLI on `$PATH`            |
+| CMux     | `CMUX_WORKSPACE_ID` | its Unix socket (`CMUX_SOCKET_PATH`) |
+
+Outside of both it's a complete no-op; nothing about your config or workflow changes for callers outside a multiplexer.
+
+By default (`provider = "auto"`) csw uses whichever one it's running inside, checking Rex first. Pin a single provider if you only want csw to drive that one:
+
+```sh
+csw config set mux_provider rex    # auto | cmux | rex
+```
+
+```toml
+[mux]
+provider = "rex"
+```
+
+Pinning doesn't make csw reach out to a multiplexer it isn't running inside. It just stops it from driving the other one.
 
 ### The fixed layout
 
-The layout isn't per-pane configurable anymore — it's the same shape every time:
+The layout isn't per-pane configurable — it's the same shape every time:
 
 - **Top row**: one pane per repo the task was started with, laid out left-to-right, each running that repo's `editor` command, `cd`'d into that repo's worktree.
 - **Bottom pane**: a single pane spanning the full width, running the top-level `agent` command, `cd`'d into the *task root* — so the agent has visibility of every repo the task touches, not just one.
@@ -326,56 +350,60 @@ editor = "nvim"
 
 `csw start PROJ-123 --repos frontend,backend` then opens a workspace with `frontend` and `backend` panes side by side on top, and `claude` running in the task root underneath. Leave `editor` empty on a repo to get just an idle shell in its slot; leave `agent` unset to skip the bottom pane entirely (top row only). If neither is set, csw skips workspace creation — no empty sidebar entries.
 
-Use `csw config repo set <name> additional_panels <N>` to open extra idle tabs behind a repo's editor pane (see [Per-repo configuration](#per-repo-configuration)).
+On Rex the top row is split evenly across repos. CMux always splits 50/50, so with three or more repos the left-most pane gets half the row.
+
+Use `csw config repo set <name> additional_panels <N>` to open extra idle tabs for a repo (see [Per-repo configuration](#per-repo-configuration)).
 
 ### Attached vs. detached editors
 
-By default (`detached_editor = false`) editors run **attached**, as the top-row CMux panes described above. Set `detached_editor = true` to go back to the old behavior instead: each repo's `editor` launches as a detached GUI process (`zed .`, `code .`, ...) in its own window, independent of CMux, and no top row is built — the workspace then contains just the full-width agent pane (or nothing, if no `agent` is set).
+By default (`detached_editor = false`) editors run **attached**, as the top-row panes described above. Set `detached_editor = true` to go back to the old behavior instead: each repo's `editor` launches as a detached GUI process (`zed .`, `code .`, ...) in its own window, independent of the multiplexer, and no top row is built — the workspace then contains just the full-width agent pane (or nothing, if no `agent` is set).
 
 ```toml
-detached_editor = true   # default false (attached / CMux panes)
+detached_editor = true   # default false (attached / multiplexer panes)
 ```
 
-Attached is the right default for terminal editors (`nvim`, `hx`) — they need a pane to run in. Flip to `detached_editor = true` if your editor is a GUI app that spawns its own window (`zed`, `code`, `pycharm`); it doesn't need a CMux pane at all.
+Attached is the right default for terminal editors (`nvim`, `hx`) — they need a pane to run in. Flip to `detached_editor = true` if your editor is a GUI app that spawns its own window (`zed`, `code`, `pycharm`); it doesn't need a pane at all.
 
 ### Workspace name and color
 
 The sidebar title is `<task-id>` on its own, or `<task-id> · <title>` when `--title` was given (the title is recovered from the sidecar on resume, so day-2 `csw start PROJ-123` keeps the day-1 title even without re-passing `--title`).
 
-Each task picks a deterministic color from a curated 10-color palette by hashing its id. The same task id always gets the same color, so the sidebar entry looks the same after a rebuild.
+On CMux, each task picks a deterministic color from a curated 10-color palette by hashing its id. The same task id always gets the same color, so the sidebar entry looks the same after a rebuild. Rex sessions have no color, so this step is skipped there.
 
 ### Disabling
 
 Three escape hatches, in order of scope:
 
 ```toml
-[cmux]
-enabled = false                    # global kill-switch; csw never talks to CMux
+[mux]
+enabled = false                    # global kill-switch; csw never talks to any multiplexer
 replace_simple_workspace = false   # never reshape the current workspace; always open a new one
 ```
 
 ```sh
-csw start PROJ-123 --no-cmux              # this invocation only
+csw start PROJ-123 --no-mux               # this invocation only (--no-cmux still works)
 csw start PROJ-123 --force-new-workspace  # skip in-place adoption for this invocation
 csw done  PROJ-123 --keep-workspace       # leave the workspace open after done
 ```
 
+Configs written before Rex support used a `[cmux]` table. csw still reads it and writes it back as `[mux]` the next time it saves the config.
+
 ### Resume and idempotency
 
-On every `csw start`, csw scans CMux's workspaces for one whose name equals `<task-id>` or starts with `<task-id> · `. If it finds one, it just focuses it; no rebuild. If not, it creates a fresh workspace.
+On every `csw start`, csw scans the multiplexer's workspaces for one whose name equals `<task-id>` or starts with `<task-id> · `. If it finds one, it just focuses it; no rebuild. If not, it creates a fresh workspace.
 
-That means you can manually rename the suffix in CMux's sidebar (e.g. add a 🚧 marker) without breaking the next resume, as long as the task id stays at the start.
+That means you can manually rename the suffix in the sidebar (e.g. add a 🚧 marker) without breaking the next resume, as long as the task id stays at the start.
 
 `csw done` uses the same matcher to find what to close.
 
 ### Reshaping the current workspace in place
 
-When `csw start` would otherwise create a brand-new workspace (no existing match by name), and the workspace csw is currently running inside is "simple" — exactly one pane with one tab, no splits — csw reshapes it in place instead of opening a new sidebar entry. The current workspace gets renamed to `<task-id>` (or `<task-id> · <title>`), recolored to the task's accent color, and populated with the task layout. You see `cmux: reshaped current workspace into <name>` in the output instead of `cmux: opened workspace ...`.
+When `csw start` would otherwise create a brand-new workspace (no existing match by name), and the workspace csw is currently running inside is "simple" — exactly one pane with one tab, no splits — csw reshapes it in place instead of opening a new sidebar entry. The current workspace gets renamed to `<task-id>` (or `<task-id> · <title>`), recolored to the task's accent color (CMux only), and populated with the task layout. You see `<provider>: reshaped current <workspace|session> into <name>` in the output instead of `<provider>: opened ...`.
 
-This avoids the common case where you open a fresh CMux workspace just to type `csw start PROJ-123`, only to end up with two near-identical sidebar entries.
+This avoids the common case where you open a fresh workspace just to type `csw start PROJ-123`, only to end up with two near-identical sidebar entries.
 
 ```toml
-[cmux]
+[mux]
 replace_simple_workspace = true   # default; false disables the in-place behavior
 ```
 
@@ -384,17 +412,24 @@ csw start PROJ-123                          # adopt current simple workspace if 
 csw start PROJ-123 --force-new-workspace    # skip adoption, always open a new workspace
 ```
 
-If the current workspace has multiple panes, multiple tabs, or csw can't query the CMux side for any reason, the build falls back to creating a new workspace. The reuse-by-name path (existing workspace matching the task id) always wins over adoption: if you already have an open `PROJ-123` somewhere, csw focuses that instead of reshaping the current pane.
+If the current workspace has multiple panes, multiple tabs, or csw can't query the multiplexer for any reason, the build falls back to creating a new workspace. The reuse-by-name path (existing workspace matching the task id) always wins over adoption: if you already have an open `PROJ-123` somewhere, csw focuses that instead of reshaping the current pane.
 
 ### Editor relationship
 
-`editor` (per-repo, in `[repos.<name>]`) drives both worlds: attached (default), it becomes a top-row CMux pane's command; detached, it's spawned as a GUI process the old way, via `editor::spawn`. `--no-editor` skips launching/attaching editors for that invocation either way; `--no-cmux` skips the whole workspace (top row and agent pane both); set both for a bare start with nothing but worktrees on disk.
+`editor` (per-repo, in `[repos.<name>]`) drives both worlds: attached (default), it becomes a top-row pane's command; detached, it's spawned as a GUI process the old way, via `editor::spawn`. `--no-editor` skips launching/attaching editors for that invocation either way; `--no-mux` skips the whole workspace (top row and agent pane both); set both for a bare start with nothing but worktrees on disk.
+
+### Rex specifics
+
+- csw drives Rex through the `rex` CLI (set `CSW_REX_BIN` to use a different binary). It never starts a Rex server: if none is running, you get a warning instead.
+- Rex has no tabs inside a pane, so `additional_panels` opens each extra idle tab as its own **window** (tab) in the task's session, behind the main layout.
+- Switching the app to a newly created session is a Rex *client action*. It only works when **Remote Control** is on in Rex's settings (under Rex Server). With it off, the session is still created and shows up in the sidebar, but the app stays where it was. csw doesn't warn about this.
+- `csw done` from inside the task's own session closes that session, and the terminal you ran it from goes with it, once the cleanup is finished.
 
 ### Caveats
 
-- macOS only. CMux is macOS-only, and the integration code only fires when `CMUX_WORKSPACE_ID` is set in the env.
-- CMux failures are always soft. If the socket is unreachable or a method call fails, csw prints a single `warning: cmux: ...` line and continues. The exit code is never affected.
-- Changing `agent`, `detached_editor`, a repo's `editor`, or its `additional_panels` has no effect on an already-open workspace. To pick up the new layout, close the workspace in CMux and `csw start` again, or just `csw done` and re-start.
+- CMux is macOS-only and only kicks in when `CMUX_WORKSPACE_ID` is set; Rex only when `REX_SESSION` is set.
+- Multiplexer failures are always soft. If the socket/CLI is unreachable or a call fails, csw prints a single `warning: <provider>: ...` line and continues. The exit code is never affected.
+- Changing `agent`, `detached_editor`, a repo's `editor`, or its `additional_panels` has no effect on an already-open workspace. To pick up the new layout, close the workspace and `csw start` again, or just `csw done` and re-start.
 - Each pane's command is delivered via ` cd '<path>' && <cmd>\n` (leading space, single-quoted path). The cd line stays out of bash/zsh history when `HISTCONTROL` includes `ignorespace`; fish's history ignores leading-space lines by default.
 
 ## What lives where

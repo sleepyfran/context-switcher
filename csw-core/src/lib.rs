@@ -5,13 +5,13 @@
 //! spawning. The CLI crate builds user-facing output on top of these
 //! primitives.
 
-pub mod cmux;
 pub mod config;
 pub mod editor;
 pub mod errors;
 pub mod git;
 pub mod hooks;
 pub mod identity;
+pub mod mux;
 pub mod ops;
 pub mod paths;
 pub mod progress;

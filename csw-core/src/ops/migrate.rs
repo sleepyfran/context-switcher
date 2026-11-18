@@ -84,8 +84,7 @@ pub fn scan_legacy(cfg: &Config) -> Result<Vec<LegacyTask>> {
 /// parsing the checked-out branch as `user/task_id`.
 fn identify_owner(worktree: &std::path::Path, leaf_name: &str) -> Option<(String, String)> {
     if let Some(sidecar) = sidecar::read(worktree).ok().flatten() {
-        if let Some(user) =
-            paths::split_worktree_dirname_by_known_task(leaf_name, &sidecar.task_id)
+        if let Some(user) = paths::split_worktree_dirname_by_known_task(leaf_name, &sidecar.task_id)
         {
             return Some((user, sidecar.task_id));
         }
@@ -193,7 +192,7 @@ mod tests {
                     default_repos: vec![],
                     agent: None,
                     detached_editor: true,
-                    cmux: None,
+                    mux: None,
                     repos: BTreeMap::new(),
                 },
                 _tmp: tmp,

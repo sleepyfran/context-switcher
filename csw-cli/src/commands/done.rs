@@ -1,9 +1,9 @@
 use crate::cli::DoneArgs;
 use crate::{output, progress};
 use anyhow::{Result, anyhow};
-use csw_core::cmux::CmuxOutcome;
 use csw_core::config::Config;
 use csw_core::identity;
+use csw_core::mux::MuxOutcome;
 use csw_core::ops::{self, BlockingIssue, DonePlan, DoneRequest};
 use csw_core::paths;
 use std::io::{self, BufRead, Write};
@@ -65,22 +65,25 @@ pub fn run(args: DoneArgs) -> Result<i32> {
     for (repo, err) in &report.failures {
         output::error(format!("{repo}: {err:#}"));
     }
-    render_cmux(&report.cmux);
+    render_mux(&report.mux);
     if report.any_failure() { Ok(2) } else { Ok(0) }
 }
 
-fn render_cmux(outcome: &CmuxOutcome) {
+fn render_mux(outcome: &MuxOutcome) {
     match outcome {
-        CmuxOutcome::NotApplicable | CmuxOutcome::NotClosed => {}
-        CmuxOutcome::Closed { name } => output::step(format!("cmux: closed workspace {name}")),
-        CmuxOutcome::Warned(msg) => output::warn(msg.clone()),
+        MuxOutcome::NotApplicable | MuxOutcome::NotClosed => {}
+        MuxOutcome::Closed { provider, name } => output::step(format!(
+            "{provider}: closed {} {name}",
+            provider.workspace_noun()
+        )),
+        MuxOutcome::Warned(msg) => output::warn(msg.clone()),
         // done should never produce a Created/Adopted/Reused/NoContributors/Renamed outcome.
-        CmuxOutcome::Created { .. }
-        | CmuxOutcome::Adopted { .. }
-        | CmuxOutcome::Reused { .. }
-        | CmuxOutcome::NoContributors
-        | CmuxOutcome::Renamed { .. }
-        | CmuxOutcome::NotRenamed => {}
+        MuxOutcome::Created { .. }
+        | MuxOutcome::Adopted { .. }
+        | MuxOutcome::Reused { .. }
+        | MuxOutcome::NoContributors
+        | MuxOutcome::Renamed { .. }
+        | MuxOutcome::NotRenamed => {}
     }
 }
 

@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "csw",
     version,
-    about = "Per-task git worktrees across one or more repos, with editor/CMux integration.",
+    about = "Per-task git worktrees across one or more repos, with editor and terminal multiplexer (CMux, Rex) integration.",
     propagate_version = true
 )]
 pub struct Cli {
@@ -52,7 +52,7 @@ pub enum Command {
     List(ListArgs),
 
     /// Change a task's title. Updates every per-repo sidecar and the
-    /// CMux workspace label (when running inside CMux).
+    /// multiplexer workspace label (when running inside CMux or Rex).
     Retitle(RetitleArgs),
 
     /// Manage the configuration.
@@ -89,9 +89,9 @@ pub struct RetitleArgs {
     /// New title (when a task id is given as the first positional).
     pub title: Option<String>,
 
-    /// Suppress the CMux workspace rename for this invocation.
-    #[arg(long)]
-    pub no_cmux: bool,
+    /// Suppress the multiplexer workspace rename for this invocation.
+    #[arg(long, alias = "no-cmux")]
+    pub no_mux: bool,
 }
 
 #[derive(Args, Debug)]
@@ -126,14 +126,15 @@ pub struct StartArgs {
     #[arg(long)]
     pub skip_hooks: bool,
 
-    /// Suppress the CMux workspace integration for this invocation. No
-    /// effect outside CMux or when the integration is globally disabled.
-    #[arg(long)]
-    pub no_cmux: bool,
+    /// Suppress the multiplexer (CMux/Rex) integration for this invocation.
+    /// No effect outside a multiplexer or when the integration is globally
+    /// disabled. `--no-cmux` is accepted as an alias.
+    #[arg(long, alias = "no-cmux")]
+    pub no_mux: bool,
 
-    /// Always create a new CMux workspace, even when the current one is
+    /// Always create a new multiplexer workspace, even when the current one is
     /// simple enough to be reshaped in place. Overrides the
-    /// `cmux.replace_simple_workspace` config setting for this invocation.
+    /// `mux.replace_simple_workspace` config setting for this invocation.
     #[arg(long)]
     pub force_new_workspace: bool,
 
@@ -200,7 +201,7 @@ pub struct DoneArgs {
     #[arg(long)]
     pub keep_branch: bool,
 
-    /// Don't close the matching CMux workspace. By default `csw done` closes
+    /// Don't close the matching multiplexer workspace. By default `csw done` closes
     /// `csw/<task-id>` after deleting the copies; pass this to leave it.
     #[arg(long)]
     pub keep_workspace: bool,
@@ -228,7 +229,8 @@ pub enum ConfigCommand {
     /// Print the effective configuration.
     Show,
 
-    /// Set a top-level key (`base_dir`, `tasks_dir`, `username`, `default_repos`).
+    /// Set a top-level key (`base_dir`, `tasks_dir`, `username`, `default_repos`,
+    /// `agent`, `detached_editor`, `mux_provider`).
     Set { key: String, value: String },
 
     /// Open the config file in $VISUAL/$EDITOR for manual editing.

@@ -44,7 +44,11 @@ pub fn parse_worktree_dirname(dirname: &str, user: &str) -> Option<String> {
 pub fn split_worktree_dirname_by_known_task(dirname: &str, task_id: &str) -> Option<String> {
     let suffix = format!("{SEPARATOR}{task_id}");
     let user = dirname.strip_suffix(&suffix)?;
-    if user.is_empty() { None } else { Some(user.to_string()) }
+    if user.is_empty() {
+        None
+    } else {
+        Some(user.to_string())
+    }
 }
 
 /// For a given absolute path, walk upward until we find a directory that is
@@ -108,7 +112,7 @@ mod tests {
             default_repos: vec![],
             agent: None,
             detached_editor: false,
-            cmux: None,
+            mux: None,
             repos,
         }
     }

@@ -44,10 +44,12 @@ impl Harness {
             .env("GIT_COMMITTER_EMAIL", "test@example.com")
             .env_remove("USER")
             .env_remove("USERNAME")
-            // Suppress the CMux integration during tests: even if a developer
-            // happens to have CMux running locally, csw should not try to talk
-            // to its socket from inside the harness.
-            .env_remove("CMUX_WORKSPACE_ID");
+            // Suppress the multiplexer integration during tests: even if a
+            // developer runs them from inside CMux or Rex, csw must not open,
+            // rename or close real workspaces/sessions from the harness.
+            .env_remove("CMUX_WORKSPACE_ID")
+            .env_remove("REX_SESSION")
+            .env_remove("REX_BLOCK");
         c
     }
 

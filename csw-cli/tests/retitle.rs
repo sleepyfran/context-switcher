@@ -14,7 +14,7 @@ fn started(h: &Harness, task: &str, repos: &[&str], title: Option<&str>) {
         args.push(t.into());
     }
     args.push("--no-editor".into());
-    args.push("--no-cmux".into());
+    args.push("--no-mux".into());
     h.cmd().args(&args).assert().success();
 }
 
@@ -27,7 +27,7 @@ fn retitle_changes_title_in_sidecar() {
     started(&h, "PROJ-1", &["frontend"], Some("Old"));
 
     h.cmd()
-        .args(["retitle", "PROJ-1", "New title", "--no-cmux"])
+        .args(["retitle", "PROJ-1", "New title", "--no-mux"])
         .assert()
         .success()
         .stderr(predicate::str::contains("Old"))
@@ -54,7 +54,7 @@ fn retitle_with_empty_string_clears_title() {
     started(&h, "PROJ-1", &["frontend"], Some("Old"));
 
     h.cmd()
-        .args(["retitle", "PROJ-1", "", "--no-cmux"])
+        .args(["retitle", "PROJ-1", "", "--no-mux"])
         .assert()
         .success();
 
@@ -85,7 +85,7 @@ fn retitle_infers_task_from_cwd() {
     let copy = h.worktree_path("frontend", "alice", "PROJ-1");
     h.cmd()
         .current_dir(&copy)
-        .args(["retitle", "Inferred title", "--no-cmux"])
+        .args(["retitle", "Inferred title", "--no-mux"])
         .assert()
         .success();
 
@@ -109,7 +109,7 @@ fn retitle_errors_when_no_copies_exist() {
     h.add_repo("frontend", "");
 
     h.cmd()
-        .args(["retitle", "MISSING-1", "anything", "--no-cmux"])
+        .args(["retitle", "MISSING-1", "anything", "--no-mux"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("no worktrees found"));
@@ -125,7 +125,7 @@ fn retitle_updates_every_repo_in_multi_repo_task() {
     started(&h, "PROJ-1", &["frontend", "backend"], Some("Old"));
 
     h.cmd()
-        .args(["retitle", "PROJ-1", "New", "--no-cmux"])
+        .args(["retitle", "PROJ-1", "New", "--no-mux"])
         .assert()
         .success();
 
